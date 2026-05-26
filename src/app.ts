@@ -25,12 +25,10 @@ export function buildApp() {
   // Global middleware
   // -------------------------------------------------------------------------
 
-  app.use('*', logger());
-  app.use('*', secureHeaders());
+  // CORS first so OPTIONS preflights short-circuit before any heavier work.
   app.use(
     '*',
     cors({
-      // Reflect the request origin when it is in the allow-list (required for credentials).
       origin: (origin: string | undefined) => {
         if (origin && env.CORS_ORIGINS.includes(origin)) return origin;
         if (!origin) return env.CORS_ORIGINS[0];
@@ -42,6 +40,10 @@ export function buildApp() {
       maxAge: 600,
     }),
   );
+  app.use('*', secureHeaders());
+  if (env.NODE_ENV !== 'production') {
+    app.use('*', logger());
+  }
 
   // -------------------------------------------------------------------------
   // Routes
