@@ -9,6 +9,7 @@ import { buildApp } from '../src/app.js';
 
 export const config = {
   runtime: 'nodejs',
+  maxDuration: 10,
 };
 
 const app = buildApp();

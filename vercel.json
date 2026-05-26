@@ -3,12 +3,17 @@
   "installCommand": "npm ci --include=dev",
   "buildCommand": "npm run typecheck",
   "functions": {
-    "api/index.ts": {
+    "api/health.ts": {
       "memory": 256,
+      "maxDuration": 10
+    },
+    "api/index.ts": {
+      "memory": 1024,
       "maxDuration": 10
     }
   },
   "rewrites": [
-    { "source": "/(.*)", "destination": "/api/index" }
+    { "source": "/health", "destination": "/api/health" },
+    { "source": "/(.*)", "destination": "/api" }
   ]
 }

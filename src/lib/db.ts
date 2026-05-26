@@ -25,7 +25,7 @@ export function getDb() {
     max: 1,
     prepare: false,
     idle_timeout: 20,
-    connect_timeout: 10,
+    connect_timeout: 5,
   });
 
   _db = drizzle(_sql, { schema, casing: 'snake_case' });
