@@ -1,17 +1,19 @@
 /**
- * Vercel serverless function entry point.
- *
- * vercel.json rewrites every incoming path to `/api`, which lands here.
- * Hono handles the actual routing.
+ * Vercel serverless entry — lazy-loads the Hono app so /health can stay lightweight.
  */
-import { handle } from 'hono/vercel';
-import { buildApp } from '../src/app.js';
+import type { Hono } from 'hono';
 
 export const config = {
   runtime: 'nodejs',
   maxDuration: 10,
 };
 
-const app = buildApp();
+let app: Hono | null = null;
 
-export default handle(app);
+export default async function handler(req: Request): Promise<Response> {
+  if (!app) {
+    const { buildApp } = await import('../src/app.js');
+    app = buildApp();
+  }
+  return app.fetch(req);
+}

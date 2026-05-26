@@ -1,14 +1,17 @@
 /**
- * Lightweight health check — no DB, no auth, fast cold start on Vercel.
+ * Edge health check — minimal cold start, no Node postgres bundle.
  */
 export const config = {
-  runtime: 'nodejs',
+  runtime: 'edge',
 };
 
 export default function handler(): Response {
-  return Response.json({
-    status: 'ok',
-    env: process.env.NODE_ENV ?? 'unknown',
-    timestamp: new Date().toISOString(),
-  });
+  return new Response(
+    JSON.stringify({
+      status: 'ok',
+      env: process.env.NODE_ENV ?? 'unknown',
+      timestamp: new Date().toISOString(),
+    }),
+    { headers: { 'content-type': 'application/json' } },
+  );
 }

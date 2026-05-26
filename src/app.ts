@@ -30,7 +30,11 @@ export function buildApp() {
   app.use(
     '*',
     cors({
-      origin: env.CORS_ORIGINS,
+      // Reflect the request origin when it is in the allow-list (required for credentials).
+      origin: (origin) => {
+        if (!origin) return env.CORS_ORIGINS[0] ?? '';
+        return env.CORS_ORIGINS.includes(origin) ? origin : '';
+      },
       credentials: true,
       allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
       allowHeaders: ['Content-Type', 'Authorization'],
