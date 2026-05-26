@@ -31,9 +31,10 @@ export function buildApp() {
     '*',
     cors({
       // Reflect the request origin when it is in the allow-list (required for credentials).
-      origin: (origin) => {
-        if (!origin) return env.CORS_ORIGINS[0] ?? '';
-        return env.CORS_ORIGINS.includes(origin) ? origin : '';
+      origin: (origin: string | undefined) => {
+        if (origin && env.CORS_ORIGINS.includes(origin)) return origin;
+        if (!origin) return env.CORS_ORIGINS[0];
+        return null;
       },
       credentials: true,
       allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],

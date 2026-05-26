@@ -1,6 +1,6 @@
 import { createRemoteJWKSet, decodeJwt, jwtVerify } from 'jose';
 import type { JWTPayload } from 'jose';
-import { requireSupabase } from '../env.js';
+import { requireSupabaseAuth } from '../env.js';
 
 /**
  * Supabase-issued JWT verification.
@@ -36,7 +36,7 @@ export interface SupabaseTokenPayload extends JWTPayload {
 }
 
 export async function verifySupabaseToken(token: string): Promise<SupabaseTokenPayload> {
-  const sup = requireSupabase();
+  const sup = requireSupabaseAuth();
 
   // Peek at the (unverified) token so we can give actionable error messages
   // when the signature/claims later don't match what we expect.

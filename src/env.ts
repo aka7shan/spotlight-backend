@@ -52,23 +52,30 @@ export const env: Env = parsed.data;
  * We allow startup with these unset so the /health endpoint works
  * even before Supabase is configured.
  */
-export function requireSupabase(): {
+/** For JWT verification on /v1/me — does not need the service_role key. */
+export function requireSupabaseAuth(): {
   url: string;
   anonKey: string;
-  serviceRoleKey: string;
   jwtSecret?: string;
 } {
-  if (!env.SUPABASE_URL || !env.SUPABASE_ANON_KEY || !env.SUPABASE_SERVICE_ROLE_KEY) {
+  if (!env.SUPABASE_URL || !env.SUPABASE_ANON_KEY) {
     throw new Error(
-      'Supabase env vars are not configured. Set SUPABASE_URL, SUPABASE_ANON_KEY, and SUPABASE_SERVICE_ROLE_KEY.',
+      'Supabase auth env vars are not configured. Set SUPABASE_URL and SUPABASE_ANON_KEY.',
     );
   }
   return {
     url: env.SUPABASE_URL,
     anonKey: env.SUPABASE_ANON_KEY,
-    serviceRoleKey: env.SUPABASE_SERVICE_ROLE_KEY,
     jwtSecret: env.SUPABASE_JWT_SECRET,
   };
+}
+
+/** For admin/server tasks that bypass RLS (not used by profile CRUD today). */
+export function requireSupabaseServiceRole(): string {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) {
+    throw new Error('SUPABASE_SERVICE_ROLE_KEY is not configured.');
+  }
+  return env.SUPABASE_SERVICE_ROLE_KEY;
 }
 
 export function requireDatabase(): string {
