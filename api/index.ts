@@ -1,24 +1,17 @@
 /**
- * Vercel serverless entry — lazy-loads the Hono app so /health can stay lightweight.
+ * Vercel serverless entry point.
+ *
+ * vercel.json rewrites all non-/health paths to `/api`, which lands here.
+ * Hono handles the actual routing using the original request URL.
  */
-import type { Hono } from 'hono';
-import type { AuthVariables } from '../src/middleware/auth.js';
+import { handle } from 'hono/vercel';
+import { buildApp } from '../src/app.js';
 
 export const config = {
   runtime: 'nodejs',
   maxDuration: 10,
 };
 
-type SpotlightApp = Hono<{ Variables: AuthVariables }>;
+const app = buildApp();
 
-let app: SpotlightApp | null = null;
-
-export default async function handler(req: Request): Promise<Response> {
-  if (!app) {
-    const { buildApp } = await import('../src/app.js');
-    app = buildApp();
-  }
-
-  const hono = app;
-  return hono.fetch(req);
-}
+export default handle(app);
