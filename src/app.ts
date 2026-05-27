@@ -4,6 +4,7 @@ import { logger } from 'hono/logger';
 import { secureHeaders } from 'hono/secure-headers';
 import { env } from './env.js';
 import { errorHandler } from './middleware/error.js';
+import { accessLog } from './middleware/access-log.js';
 import type { AuthVariables } from './middleware/auth.js';
 import { healthRoutes } from './routes/health.js';
 import { meRoutes } from './routes/me.js';
@@ -36,13 +37,20 @@ export function buildApp() {
       },
       credentials: true,
       allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-      allowHeaders: ['Content-Type', 'Authorization'],
+      // X-Request-Id is a forward-looking addition: lets the frontend supply
+      // its own correlation id so logs on both sides line up. Free to add now.
+      allowHeaders: ['Content-Type', 'Authorization', 'X-Request-Id'],
       maxAge: 600,
     }),
   );
   app.use('*', secureHeaders());
+
+  // Dev: colored one-line-per-request log for fast feedback.
+  // Prod: structured JSON, only for errors and slow requests (see accessLog).
   if (env.NODE_ENV !== 'production') {
     app.use('*', logger());
+  } else {
+    app.use('*', accessLog({ slowMs: 1500 }));
   }
 
   // -------------------------------------------------------------------------

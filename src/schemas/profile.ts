@@ -148,6 +148,22 @@ export const LanguageSchema = z.object({
  *
  * `name` and `title` are the **only** profile-level required fields.
  * Everything else is `.nullish()` so it accepts `null`/`undefined`/empty.
+ *
+ * Update semantics (PUT /v1/me)
+ * -----------------------------
+ *  Despite the HTTP verb, this endpoint behaves like a **patch** for scalar
+ *  fields and a **replace** for array fields. Specifically:
+ *
+ *    Field is omitted / undefined / null  → keep existing value
+ *    Field is empty string ('')           → clear (write SQL NULL)
+ *    Field is a non-empty value           → overwrite
+ *    Array is omitted / undefined         → keep existing array
+ *    Array is provided ([] or [...])      → replace entire array (full wipe + insert)
+ *
+ *  The frontend round-trips whatever it loaded from GET /v1/me, so the
+ *  "omit = keep" rule means clients don't lose data when they only edited
+ *  one section. If you ever need a true PUT (full replace, missing = clear),
+ *  add a separate endpoint instead of changing this one.
  */
 export const UpdateMeSchema = z.object({
   name: required(200),

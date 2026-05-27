@@ -1,4 +1,4 @@
-import { createRemoteJWKSet, decodeJwt, jwtVerify } from 'jose';
+import { createRemoteJWKSet, decodeJwt, decodeProtectedHeader, jwtVerify } from 'jose';
 import type { JWTPayload } from 'jose';
 import { requireSupabaseAuth } from '../env.js';
 
@@ -38,26 +38,34 @@ export interface SupabaseTokenPayload extends JWTPayload {
 export async function verifySupabaseToken(token: string): Promise<SupabaseTokenPayload> {
   const sup = requireSupabaseAuth();
 
-  // Peek at the (unverified) token so we can give actionable error messages
-  // when the signature/claims later don't match what we expect.
+  // Peek at the (unverified) token so we can:
+  //   1. Pick the right verifier based on the `alg` header (no wasted HS256
+  //      attempt on JWKS-only projects).
+  //   2. Give actionable error messages when verification later fails.
   let unverified: JWTPayload | null = null;
+  let alg: string | undefined;
   try {
     unverified = decodeJwt(token);
+    alg = decodeProtectedHeader(token).alg;
   } catch {
     // We'll let jwtVerify throw the real error below.
   }
 
-  // We verify SIGNATURE strictly, but only soft-check claims like `iss`. The
-  // Supabase issuer claim has changed between project generations
-  // (`https://<ref>.supabase.co/auth/v1` for older projects, `supabase` for
-  // some others) so locking it down here causes more outages than it prevents.
-  // RLS + audience checks still keep us safe.
+  // Strict signature verification, soft claim checks. The Supabase issuer
+  // claim has changed between project generations (`https://<ref>.supabase.co/auth/v1`
+  // for older projects, `supabase` for some others); locking it down here
+  // causes more outages than it prevents. RLS + audience keep us safe.
   const commonOptions = {
     audience: 'authenticated',
   } as const;
 
-  // HS256 (shared secret) — default for legacy projects without JWT Signing Keys
-  if (sup.jwtSecret) {
+  // Prefer the path indicated by the token's own `alg` header so we don't
+  // burn a verify attempt that's guaranteed to fail. Fall back to "try both"
+  // if we couldn't decode the header (malformed token — let jose tell us).
+  const tryHS256 = sup.jwtSecret && (alg === 'HS256' || alg == null);
+  const tryJWKS = alg !== 'HS256' || !sup.jwtSecret;
+
+  if (tryHS256 && sup.jwtSecret) {
     try {
       const { payload } = await jwtVerify(
         token,
@@ -68,10 +76,13 @@ export async function verifySupabaseToken(token: string): Promise<SupabaseTokenP
       return payload as SupabaseTokenPayload;
     } catch (err) {
       const code = (err as { code?: string })?.code;
+      // Only fall through to JWKS for errors that suggest "wrong key" —
+      // signature mismatch or unexpected alg. Anything else (expired,
+      // audience mismatch, malformed) is terminal and we re-throw.
       const recoverable =
         code === 'ERR_JWS_SIGNATURE_VERIFICATION_FAILED' ||
         code === 'ERR_JOSE_ALG_NOT_ALLOWED';
-      if (!recoverable) throw err;
+      if (!recoverable || !tryJWKS) throw err;
     }
   }
 
@@ -87,7 +98,7 @@ export async function verifySupabaseToken(token: string): Promise<SupabaseTokenP
     if (unverified) {
       console.error('[jwt] verify failed', {
         code,
-        alg: (unverified as { header?: { alg?: string } }).header?.alg,
+        alg,
         iss: unverified.iss,
         aud: unverified.aud,
         sub: unverified.sub,

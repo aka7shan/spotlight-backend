@@ -54,17 +54,41 @@ export interface AssembledUser {
   updatedAt: string;
 }
 
+// Wire (frontend Zod enum) ↔ DB (Postgres pg_enum) bidirectional maps.
+// The `satisfies` clauses make these maps a compile-time exhaustiveness
+// check: if you add a new variant to either side, TS will flag the missing
+// entry here. That's worth a lot — it's the kind of bug that ships silently
+// until a user picks the new value and gets a 500.
+
+type ProjectStatusWire = 'Completed' | 'In Progress' | 'Planned';
+type ProjectStatusDb = 'completed' | 'in_progress' | 'planned';
+
 const PROJECT_STATUS_TO_DB = {
   Completed: 'completed',
   'In Progress': 'in_progress',
   Planned: 'planned',
-} as const;
+} as const satisfies Record<ProjectStatusWire, ProjectStatusDb>;
 
 const PROJECT_STATUS_FROM_DB = {
   completed: 'Completed',
   in_progress: 'In Progress',
   planned: 'Planned',
-} as const;
+} as const satisfies Record<ProjectStatusDb, ProjectStatusWire>;
+
+type LanguageLevelWire =
+  | 'Beginner'
+  | 'Intermediate'
+  | 'Advanced'
+  | 'Fluent'
+  | 'Native'
+  | 'Expert';
+type LanguageLevelDb =
+  | 'beginner'
+  | 'intermediate'
+  | 'advanced'
+  | 'fluent'
+  | 'native'
+  | 'expert';
 
 const LANGUAGE_LEVEL_TO_DB = {
   Beginner: 'beginner',
@@ -73,7 +97,7 @@ const LANGUAGE_LEVEL_TO_DB = {
   Fluent: 'fluent',
   Native: 'native',
   Expert: 'expert',
-} as const;
+} as const satisfies Record<LanguageLevelWire, LanguageLevelDb>;
 
 const LANGUAGE_LEVEL_FROM_DB = {
   beginner: 'Beginner',
@@ -82,7 +106,7 @@ const LANGUAGE_LEVEL_FROM_DB = {
   fluent: 'Fluent',
   native: 'Native',
   expert: 'Expert',
-} as const;
+} as const satisfies Record<LanguageLevelDb, LanguageLevelWire>;
 
 // ---------------------------------------------------------------------------
 // Read
@@ -242,6 +266,12 @@ export async function saveAssembledUser(userId: string, input: UpdateMeInput) {
         ...(input.cv?.fileUrl != null ? { cvFileUrl: input.cv.fileUrl } : {}),
         ...(input.cv?.fileSize != null ? { cvFileSize: input.cv.fileSize } : {}),
         ...(input.cv?.fileType != null ? { cvFileType: input.cv.fileType } : {}),
+        // Always bump updatedAt even when only related arrays change (skills,
+        // experience, etc.). $onUpdate on the column is a safety net for any
+        // future direct-update path; setting it explicitly here also ensures
+        // Drizzle actually emits an UPDATE when the spreads above are all
+        // empty (which would otherwise be a no-op).
+        updatedAt: new Date(),
       })
       .where(eq(profiles.userId, userId))
       .returning({ userId: profiles.userId });

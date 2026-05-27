@@ -52,10 +52,17 @@ export const env: Env = parsed.data;
  * We allow startup with these unset so the /health endpoint works
  * even before Supabase is configured.
  */
-/** For JWT verification on /v1/me — does not need the service_role key. */
+/**
+ * For JWT verification on /v1/me — does not need the service_role key.
+ *
+ * SUPABASE_URL is required so we can hit the JWKS endpoint when the project
+ * uses asymmetric signing keys. SUPABASE_ANON_KEY is still required to be
+ * *present* (we treat it as a sanity check that the env is wired up) even
+ * though the verifier itself doesn't need it — clients use it to mint tokens
+ * in the first place.
+ */
 export function requireSupabaseAuth(): {
   url: string;
-  anonKey: string;
   jwtSecret?: string;
 } {
   if (!env.SUPABASE_URL || !env.SUPABASE_ANON_KEY) {
@@ -65,7 +72,6 @@ export function requireSupabaseAuth(): {
   }
   return {
     url: env.SUPABASE_URL,
-    anonKey: env.SUPABASE_ANON_KEY,
     jwtSecret: env.SUPABASE_JWT_SECRET,
   };
 }

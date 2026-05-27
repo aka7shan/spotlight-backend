@@ -101,9 +101,14 @@ export const profiles = pgTable(
     createdAt: timestamp('created_at', { withTimezone: true })
       .notNull()
       .default(sql`now()`),
+    // $onUpdate makes Drizzle stamp this column on every UPDATE statement it
+    // emits. Without it the `default(now())` only fires on INSERT and the
+    // column gets stuck at the row's creation time — which is what was
+    // happening before.
     updatedAt: timestamp('updated_at', { withTimezone: true })
       .notNull()
-      .default(sql`now()`),
+      .default(sql`now()`)
+      .$onUpdate(() => new Date()),
   },
   (t) => [
     uniqueIndex('profiles_username_uniq').on(t.username),
