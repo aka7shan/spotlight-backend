@@ -30,17 +30,36 @@ const authProfileBootstrap = (c: { var: AuthVariables }) => ({
 });
 
 meRoutes.get('/', async (c) => {
+  // Phase-level timing so we can see in Vercel logs which step is slow when
+  // a user reports lag. Log line shape:
+  //   [me.get] ensure=12ms assemble=180ms total=193ms userId=...
+  // Use process.hrtime.bigint() to avoid Date.now()'s 1ms granularity quirks
+  // on Node's monotonic-but-rounded clock.
+  const t0 = process.hrtime.bigint();
+
   const bootstrap = authProfileBootstrap(c);
   if (!bootstrap.email) {
     throw new HTTPException(400, { message: 'Auth token is missing an email claim' });
   }
   await ensureProfile(bootstrap);
+  const tEnsure = process.hrtime.bigint();
+
   const user = await getAssembledUser(bootstrap.userId);
   if (!user) {
     // ensureProfile didn't throw but the row still isn't visible — should be
     // impossible, but fail loudly if it happens.
     throw new HTTPException(500, { message: 'Profile creation failed' });
   }
+  const tAssemble = process.hrtime.bigint();
+
+  const ms = (a: bigint, b: bigint) => Number((b - a) / 1_000_000n);
+  console.log(
+    `[me.get] ensure=${ms(t0, tEnsure)}ms assemble=${ms(
+      tEnsure,
+      tAssemble,
+    )}ms total=${ms(t0, tAssemble)}ms userId=${bootstrap.userId}`,
+  );
+
   return c.json({ user });
 });
 
