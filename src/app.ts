@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { bodyLimit } from 'hono/body-limit';
 import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
 import { secureHeaders } from 'hono/secure-headers';
@@ -8,6 +9,19 @@ import { accessLog } from './middleware/access-log.js';
 import type { AuthVariables } from './middleware/auth.js';
 import { healthRoutes } from './routes/health.js';
 import { meRoutes } from './routes/me.js';
+
+/**
+ * Hard ceiling on request body size at the Hono layer.
+ *
+ * Vercel rejects bodies > 4.5 MB at the platform layer with an opaque
+ * error; rejecting earlier with a clean 413 + JSON envelope is friendlier.
+ *
+ * Sized at 6 MB right now because the Phase 0 frontend can still produce
+ * an avatar payload up to ~6.7 MB (a 5 MB image base64-encoded). Once
+ * avatar uploads move to Supabase Storage the avatar/cover image fields
+ * become URLs and this can drop to ~256 KB.
+ */
+const MAX_BODY_BYTES = 6 * 1024 * 1024;
 
 /**
  * Build the Hono app.
@@ -52,6 +66,26 @@ export function buildApp() {
   } else {
     app.use('*', accessLog({ slowMs: 1500 }));
   }
+
+  // Body-size guard. Applied globally — bodyLimit short-circuits via the
+  // Content-Length header for requests that don't have a body, so the cost
+  // on GETs is one header read.
+  app.use(
+    '*',
+    bodyLimit({
+      maxSize: MAX_BODY_BYTES,
+      onError: (c) =>
+        c.json(
+          {
+            error: {
+              code: 413,
+              message: `Request body exceeds the ${Math.round(MAX_BODY_BYTES / 1024 / 1024)} MB limit.`,
+            },
+          },
+          413,
+        ),
+    }),
+  );
 
   // -------------------------------------------------------------------------
   // Routes

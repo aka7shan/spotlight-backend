@@ -3,6 +3,7 @@ import { HTTPException } from 'hono/http-exception';
 import { zValidator } from '@hono/zod-validator';
 import { z } from 'zod';
 import { requireAuth, type AuthVariables } from '../middleware/auth.js';
+import { rateLimitByUser } from '../middleware/rate-limit.js';
 import { UpdateMeSchema } from '../schemas/profile.js';
 import {
   ensureProfile,
@@ -13,10 +14,35 @@ import {
 
 /**
  * /v1/me — operations on the currently authenticated user's profile.
+ *
+ * Rate-limit policy
+ * -----------------
+ *  GET /v1/me  — 120 req/min/user. The frontend fetches this exactly once
+ *                per session today, so the only legitimate way to hit this
+ *                ceiling is a misbehaving client (retry storm, useEffect
+ *                in a loop). We still want the ceiling — that's what
+ *                catches the broken client before it floods our logs.
+ *
+ *  PUT /v1/me  — 20 req/min/user. The save button is debounced in the UI
+ *                and a real user can't legitimately save 20+ times per
+ *                minute. This protects the DB transaction (delete + bulk
+ *                insert across 7 child tables) from being hammered.
  */
 export const meRoutes = new Hono<{ Variables: AuthVariables }>();
 
 meRoutes.use('*', requireAuth);
+
+const readLimiter = rateLimitByUser({
+  scope: 'me.read',
+  limit: 120,
+  windowMs: 60_000,
+});
+
+const writeLimiter = rateLimitByUser({
+  scope: 'me.write',
+  limit: 20,
+  windowMs: 60_000,
+});
 
 /**
  * Pull email/name out of the verified JWT so we can self-heal a missing
@@ -29,7 +55,7 @@ const authProfileBootstrap = (c: { var: AuthVariables }) => ({
   name: (c.var.user.raw.user_metadata?.name as string | undefined) ?? '',
 });
 
-meRoutes.get('/', async (c) => {
+meRoutes.get('/', readLimiter, async (c) => {
   // Phase-level timing so we can see in Vercel logs which step is slow when
   // a user reports lag. Log line shape:
   //   [me.get] ensure=12ms assemble=180ms total=193ms userId=...
@@ -65,6 +91,7 @@ meRoutes.get('/', async (c) => {
 
 meRoutes.put(
   '/',
+  writeLimiter,
   zValidator('json', UpdateMeSchema, (result, c) => {
     if (!result.success) {
       // Log full diagnostic server-side. The client only sees a sanitized

@@ -284,11 +284,18 @@ export async function saveAssembledUser(userId: string, input: UpdateMeInput) {
     }
 
     // 2. Replace skills
+    //
+    // The (user_id, name) unique index means duplicates in the same payload
+    // would raise postgres error 23505 and roll back the entire transaction.
+    // That's a noisy 500 for what's almost always a benign user mistake (or
+    // an auto-suggest dropdown firing twice), so we silently dedupe here.
+    // First occurrence wins to preserve user-controlled ordering.
     if (input.skills) {
       await tx.delete(skills).where(eq(skills.userId, userId));
-      if (input.skills.length > 0) {
+      const dedupedSkills = dedupeKeepFirst(input.skills, (s) => s);
+      if (dedupedSkills.length > 0) {
         await tx.insert(skills).values(
-          input.skills.map((name, position) => ({ userId, name, position })),
+          dedupedSkills.map((name, position) => ({ userId, name, position })),
         );
       }
     }
@@ -402,11 +409,17 @@ export async function saveAssembledUser(userId: string, input: UpdateMeInput) {
     }
 
     // 8. Replace languages
+    //
+    // Same story as skills — (user_id, name) is a unique index. If the user
+    // accidentally lists "English" twice (e.g. one at Beginner, one at
+    // Advanced, intent unclear), we keep the LAST entry so an "I want to
+    // upgrade my level" intent isn't silently ignored.
     if (input.languages) {
       await tx.delete(languages).where(eq(languages.userId, userId));
-      if (input.languages.length > 0) {
+      const dedupedLanguages = dedupeKeepLast(input.languages, (l) => l.name);
+      if (dedupedLanguages.length > 0) {
         await tx.insert(languages).values(
-          input.languages.map((l, position_order) => ({
+          dedupedLanguages.map((l, position_order) => ({
             userId,
             name: l.name,
             level: LANGUAGE_LEVEL_TO_DB[l.level],
@@ -417,6 +430,38 @@ export async function saveAssembledUser(userId: string, input: UpdateMeInput) {
       }
     }
   });
+}
+
+// ---------------------------------------------------------------------------
+// Dedup helpers
+// ---------------------------------------------------------------------------
+//
+// Both arrays we save (skills, languages) sit behind unique indexes. The
+// strategies differ:
+//   - skills: identity ⇒ first wins, preserves user-controlled ordering
+//   - languages: by name ⇒ last wins, so "I want to update my level"
+//     intent is honored
+
+function dedupeKeepFirst<T>(arr: readonly T[], getKey: (item: T) => string): T[] {
+  const seen = new Set<string>();
+  const out: T[] = [];
+  for (const item of arr) {
+    const k = getKey(item);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(item);
+  }
+  return out;
+}
+
+function dedupeKeepLast<T>(arr: readonly T[], getKey: (item: T) => string): T[] {
+  // Map preserves insertion order; setting an existing key keeps it in
+  // place but updates the value to the latest entry.
+  const map = new Map<string, T>();
+  for (const item of arr) {
+    map.set(getKey(item), item);
+  }
+  return Array.from(map.values());
 }
 
 export class ProfileNotFoundError extends Error {
