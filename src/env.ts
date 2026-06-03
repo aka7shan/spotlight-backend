@@ -49,17 +49,16 @@ export const env: Env = parsed.data;
 
 /**
  * Helpers that throw if a required-for-feature variable is missing.
- * We allow startup with these unset so the /health endpoint works
- * even before Supabase is configured.
- */
-/**
- * For JWT verification on /v1/me — does not need the service_role key.
+ *
+ * We allow startup with optional Supabase/DB vars unset so /health works
+ * even before the project is fully configured. The features that *need*
+ * those vars call these helpers and get a clear error if they're missing.
  *
  * SUPABASE_URL is required so we can hit the JWKS endpoint when the project
- * uses asymmetric signing keys. SUPABASE_ANON_KEY is still required to be
- * *present* (we treat it as a sanity check that the env is wired up) even
- * though the verifier itself doesn't need it — clients use it to mint tokens
- * in the first place.
+ * uses asymmetric signing keys. SUPABASE_ANON_KEY is required to be
+ * *present* even though the verifier itself doesn't use it — it's our
+ * sanity check that the Supabase env is actually wired up (clients use
+ * the anon key to mint tokens in the first place).
  */
 export function requireSupabaseAuth(): {
   url: string;
@@ -76,17 +75,9 @@ export function requireSupabaseAuth(): {
   };
 }
 
-/** For admin/server tasks that bypass RLS (not used by profile CRUD today). */
-export function requireSupabaseServiceRole(): string {
-  if (!env.SUPABASE_SERVICE_ROLE_KEY) {
-    throw new Error('SUPABASE_SERVICE_ROLE_KEY is not configured.');
-  }
-  return env.SUPABASE_SERVICE_ROLE_KEY;
-}
-
-export function requireDatabase(): string {
-  if (!env.DATABASE_URL) {
-    throw new Error('DATABASE_URL is not configured.');
-  }
-  return env.DATABASE_URL;
-}
+// NOTE: requireSupabaseServiceRole() and requireDatabase() used to live here
+// but had no call sites. The DB connection reads env.DATABASE_URL directly
+// (see src/lib/db.ts), and nothing in Phase 0 needs the service role key —
+// our backend connects to Postgres as the pooler superuser and JWT-verifies
+// every request itself. Re-add them when a feature actually needs the
+// indirection.
