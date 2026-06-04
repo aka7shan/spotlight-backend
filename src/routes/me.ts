@@ -106,15 +106,20 @@ const cvUploadLimiter = rateLimitByUser({
 //   - Gemini API call (1 input token ≈ 4 chars; a typical CV is ~2K-8K
 //     input tokens + ~1K output tokens)
 //
-// Gemini's free tier is 1500 req/day across the whole project; we want
-// to keep that budget for legitimate use plus 1.3 (chat). A single user
-// burning hundreds of parses to test the diff UI would empty the
-// budget. 5/hour + 20/day is generous for legitimate use, strict enough
-// to bound spend.
+// Gemini's free tier is 1500 req/day across the whole project. 20/hour
+// per user gives plenty of headroom for testing without letting a single
+// user burn the whole daily budget if they leave a tab open.
+//
+// We override `userMessage` because users (very reasonably) confuse OUR
+// 429 with Gemini's quota — the error message has to make ownership
+// obvious or we get bug reports about Google's dashboard "lying".
 const cvParseLimiter = rateLimitByUser({
   scope: 'me.cv.parse',
-  limit: 5,
+  limit: 20,
   windowMs: 60 * 60_000,
+  userMessage:
+    "You've reached our per-user limit of 20 AI parses per hour. " +
+    "(This is the Spotlight backend's limit, not Gemini's.)",
 });
 
 /**

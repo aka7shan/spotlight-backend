@@ -39,6 +39,18 @@ interface RateLimitOptions {
   keyResolver?: (c: Context) => string;
   /** Optional human-readable label appended to the 429 message and key namespace. */
   scope?: string;
+  /**
+   * Custom message rendered to the user on 429. The default leaks the
+   * scope name ("Too many requests (me.cv.parse)…") which is fine for
+   * debugging but useless to a real user — and worse, makes it look
+   * like an upstream provider's quota when it's actually OUR limiter.
+   *
+   * Pass `userMessage` to take full control of the copy; we append the
+   * remaining-time hint automatically. Use this on any endpoint where
+   * the user might confuse our 429 with a third-party 429 (e.g.
+   * anything that talks to an LLM).
+   */
+  userMessage?: string;
 }
 
 const MAX_BUCKETS = 10_000;
@@ -56,7 +68,13 @@ function defaultKey(c: Context): string {
 }
 
 export function rateLimit(opts: RateLimitOptions): MiddlewareHandler {
-  const { limit, windowMs, keyResolver = defaultKey, scope = 'global' } = opts;
+  const {
+    limit,
+    windowMs,
+    keyResolver = defaultKey,
+    scope = 'global',
+    userMessage,
+  } = opts;
 
   return async (c, next) => {
     const rawKey = keyResolver(c);
@@ -89,8 +107,22 @@ export function rateLimit(opts: RateLimitOptions): MiddlewareHandler {
 
     if (state.count > limit) {
       c.header('Retry-After', String(resetSec));
+      // Format the wait nicely — "47 min" reads better than "2820s" once
+      // we're past a minute. Sub-minute waits stay in seconds because
+      // "0 min" is uselessly imprecise.
+      const wait =
+        resetSec >= 60
+          ? `${Math.ceil(resetSec / 60)} min`
+          : `${resetSec}s`;
+      const base = userMessage ?? `Too many requests (${scope}).`;
+      // Log the scope server-side regardless of whether we leaked it to
+      // the client. Operators reading Vercel logs want to know which
+      // limiter tripped without grepping route code.
+      console.warn(
+        `[ratelimit] 429 scope=${scope} key=${rawKey} count=${state.count}/${limit} resetSec=${resetSec}`,
+      );
       throw new HTTPException(429, {
-        message: `Too many requests (${scope}). Try again in ${resetSec}s.`,
+        message: `${base} Try again in ${wait}.`,
       });
     }
 
