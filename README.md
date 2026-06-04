@@ -6,7 +6,7 @@ Hono API for Spotlight Portfolio: JWT auth, profile CRUD, Postgres via Drizzle.
 [github.com/aka7shan/spotlight-portfolio](https://github.com/aka7shan/spotlight-portfolio)
 
 ```
-OneDrive - AMDOCS/
+Project
 ├── spotlight-portfolio/    ← frontend (existing Git)
 └── Spotlight-backend/      ← this repo (new Git remote)
 ```

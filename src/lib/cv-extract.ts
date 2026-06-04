@@ -146,7 +146,10 @@ async function extractPdf(bytes: Uint8Array): Promise<string> {
   let extractText: typeof import('unpdf').extractText;
   try {
     ({ extractText } = await import('unpdf'));
-  } catch (err) {
+  } catch (_err) {
+    // Loader failure is opaque (could be a missing dep in the serverless
+    // bundle, an unsupported runtime, etc.). Surface as "corrupt" since
+    // there's no actionable distinction for the user.
     throw new CvExtractionError(
       'corrupt',
       'PDF extractor module failed to load on the server.',
@@ -159,7 +162,7 @@ async function extractPdf(bytes: Uint8Array): Promise<string> {
     // `string[]`, one entry per page), saving us a join here.
     const result = await extractText(bytes, { mergePages: true });
     return result.text;
-  } catch (err) {
+  } catch (_err) {
     throw new CvExtractionError(
       'corrupt',
       'Could not parse this PDF. The file may be corrupt or password-protected.',
@@ -186,7 +189,7 @@ async function extractDocx(bytes: Uint8Array): Promise<string> {
     const buf = Buffer.from(bytes);
     const { value } = await mammoth.extractRawText({ buffer: buf });
     return value;
-  } catch (err) {
+  } catch (_err) {
     throw new CvExtractionError(
       'corrupt',
       'Could not parse this .docx. The file may be corrupt or password-protected.',
