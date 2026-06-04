@@ -357,6 +357,19 @@ export const portfolios = pgTable(
       .references(() => profiles.userId, { onDelete: 'cascade' }),
 
     slug: text('slug').notNull(), // unique per user (eg "default")
+
+    /**
+     * Phase 1.2: public-facing short code. Base62 (a-zA-Z0-9), fixed length
+     * (see `SHORT_CODE_LENGTH` in src/lib/shortcode.ts). Globally unique
+     * across all portfolios — this is the entire URL identity for the public
+     * page: `spotlight.app/p/<short_code>`.
+     *
+     * Nullable in the DB so the migration can run on an existing populated
+     * table; the backend lazily backfills missing codes on first read and
+     * holds an in-process lock to avoid duplicate inserts. New rows always
+     * get a code at creation time.
+     */
+    shortCode: text('short_code'),
     templateId: text('template_id').notNull().default('classic'),
     themeOverrides: jsonb('theme_overrides').$type<Record<string, unknown>>(),
     isPublished: boolean('is_published').notNull().default(false),
@@ -367,10 +380,18 @@ export const portfolios = pgTable(
       .default(sql`now()`),
     updatedAt: timestamp('updated_at', { withTimezone: true })
       .notNull()
-      .default(sql`now()`),
+      .default(sql`now()`)
+      .$onUpdate(() => new Date()),
   },
   (t) => [
     uniqueIndex('portfolios_user_slug_uniq').on(t.userId, t.slug),
+    // Partial unique index on short_code: enforces global uniqueness while
+    // allowing the column to be NULL for not-yet-backfilled rows. The
+    // partial predicate lets multiple rows coexist with NULL but rejects
+    // any duplicate non-null code.
+    uniqueIndex('portfolios_short_code_uniq')
+      .on(t.shortCode)
+      .where(sql`${t.shortCode} IS NOT NULL`),
     index('portfolios_published_idx').on(t.isPublished, t.publishedAt),
   ],
 );

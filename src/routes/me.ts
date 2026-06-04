@@ -5,12 +5,17 @@ import { z } from 'zod';
 import { eq } from 'drizzle-orm';
 import { requireAuth, type AuthVariables } from '../middleware/auth.js';
 import { rateLimitByUser } from '../middleware/rate-limit.js';
-import { UpdateMeSchema } from '../schemas/profile.js';
+import { UpdateMeSchema, UpdateTemplateSchema } from '../schemas/profile.js';
 import {
   ensureProfile,
   getAssembledUser,
+  invalidateShortCodeCache,
+  isKnownTemplateId,
+  KNOWN_TEMPLATE_IDS,
   ProfileNotFoundError,
+  regenerateShortCode,
   saveAssembledUser,
+  setActiveTemplate,
 } from '../services/profile.js';
 import {
   ALLOWED_AVATAR_MIME_TYPES,
@@ -153,6 +158,13 @@ meRoutes.put(
     throw err;
   }
 
+  // Any profile change must invalidate the public-lookup cache so the
+  // visitor at /p/<code> sees the new data on their very next request
+  // instead of waiting up to TTL seconds for the entry to expire.
+  // We don't await this — if Redis is slow it shouldn't slow down the
+  // save response. Worst case, a viewer sees stale data for up to 60s.
+  void invalidateShortCodeCache(bootstrap.userId);
+
   const user = await getAssembledUser(bootstrap.userId);
   return c.json({ user });
 });
@@ -235,6 +247,8 @@ meRoutes.post('/avatar', avatarLimiter, async (c) => {
     .set({ avatarUrl: publicUrl, updatedAt: new Date() })
     .where(eq(profiles.userId, bootstrap.userId));
 
+  void invalidateShortCodeCache(bootstrap.userId);
+
   const user = await getAssembledUser(bootstrap.userId);
   return c.json({ user, avatarUrl: publicUrl });
 });
@@ -260,6 +274,121 @@ meRoutes.delete('/avatar', avatarLimiter, async (c) => {
     .set({ avatarUrl: null, updatedAt: new Date() })
     .where(eq(profiles.userId, bootstrap.userId));
 
+  void invalidateShortCodeCache(bootstrap.userId);
+
   const user = await getAssembledUser(bootstrap.userId);
   return c.json({ user });
+});
+
+// ---------------------------------------------------------------------------
+// Portfolio template (Phase 1.2)
+// ---------------------------------------------------------------------------
+//
+// PUT /v1/me/portfolio { templateId } — set the user's active template.
+//
+// The public URL at /p/<short_code> renders whatever this row says. Users
+// pick from the template gallery; clicking "Use this template" fires this.
+//
+// Why a dedicated route instead of folding into PUT /v1/me?
+//   - Template selection from the gallery should NOT require the user's
+//     full profile form to be in a "ready to save" state.
+//   - The frontend treats this as a fire-and-forget action (with optimistic
+//     UI); the full-profile PUT is a heavyweight transactional save.
+//   - Tighter validation surface — only one field, only one error mode.
+// ---------------------------------------------------------------------------
+
+meRoutes.put(
+  '/portfolio',
+  writeLimiter,
+  zValidator('json', UpdateTemplateSchema, (result, c) => {
+    if (!result.success) {
+      console.error(
+        '[validator] PUT /v1/me/portfolio failed:\n' + z.prettifyError(result.error),
+      );
+      return c.json(
+        {
+          error: {
+            code: 422,
+            message: 'Validation failed',
+            details: result.error.issues.map((i) => ({
+              path: i.path.join('.'),
+              message: i.message,
+            })),
+          },
+        },
+        422,
+      );
+    }
+  }),
+  async (c) => {
+    const bootstrap = authProfileBootstrap(c);
+    if (!bootstrap.email) {
+      throw new HTTPException(400, { message: 'Auth token is missing an email claim' });
+    }
+    await ensureProfile(bootstrap);
+
+    const { templateId } = c.req.valid('json');
+
+    // Allow-list check at the service-layer boundary, surfaced here as a
+    // structured 422. We could push this into the Zod schema with
+    // `z.enum(KNOWN_TEMPLATE_IDS)`, but keeping templates as a runtime
+    // allow-list means adding a new template is a one-line code change
+    // instead of a Zod-schema-plus-API-version coordination.
+    if (!isKnownTemplateId(templateId)) {
+      throw new HTTPException(422, {
+        message: `Unknown templateId "${templateId}". Known: ${KNOWN_TEMPLATE_IDS.join(', ')}.`,
+      });
+    }
+
+    const { shortCode, updatedAt } = await setActiveTemplate(bootstrap.userId, templateId);
+
+    // Template change is visible at /p/<code>, so invalidate the cache.
+    void invalidateShortCodeCache(bootstrap.userId);
+
+    return c.json({
+      portfolio: {
+        templateId,
+        shortCode,
+        updatedAt: updatedAt.toISOString(),
+      },
+    });
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Short link (Phase 1.2)
+// ---------------------------------------------------------------------------
+//
+// POST /v1/me/share-link/regenerate — issue a NEW short code, retiring
+// the previous one. Useful when the user wants to rotate a link they've
+// already shared (e.g. portfolio went under refresh, want the old URL
+// to 404).
+//
+// Rate-limited tighter than other writes: each call mints a fresh code
+// and invalidates cache, both of which are cheap individually but
+// pointless to repeat. 5/min is well above any legitimate use.
+// ---------------------------------------------------------------------------
+
+const regenerateLimiter = rateLimitByUser({
+  scope: 'me.share-link.regenerate',
+  limit: 5,
+  windowMs: 60_000,
+});
+
+meRoutes.post('/share-link/regenerate', regenerateLimiter, async (c) => {
+  const bootstrap = authProfileBootstrap(c);
+  if (!bootstrap.email) {
+    throw new HTTPException(400, { message: 'Auth token is missing an email claim' });
+  }
+  await ensureProfile(bootstrap);
+
+  // `regenerateShortCode` handles cache eviction of the OLD code
+  // internally because it has the previous value in hand and we don't
+  // want to read it twice.
+  const { shortCode, updatedAt } = await regenerateShortCode(bootstrap.userId);
+
+  return c.json({
+    shortCode,
+    updatedAt: updatedAt.toISOString(),
+  });
 });

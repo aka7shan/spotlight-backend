@@ -6,10 +6,13 @@ import {
   educations,
   experiences,
   languages,
+  portfolios,
   profiles,
   projects,
   skills,
 } from '../db/schema.js';
+import { cacheKeys, getCache } from '../lib/cache.js';
+import { generateShortCode } from '../lib/shortcode.js';
 import type {
   AchievementInput,
   CertificationInput,
@@ -50,8 +53,47 @@ export interface AssembledUser {
   certifications: CertificationInput[];
   achievements: AchievementInput[];
   languages: LanguageInput[];
+  /**
+   * Phase 1.2: which portfolio template is the user's "active" one,
+   * i.e. the one rendered at their public URL. Defaults to 'classic' if
+   * the user has never picked. Always present in the response so the
+   * frontend never has to handle "missing template" branching.
+   */
+  activeTemplate: string;
+  /**
+   * Phase 1.2: Base62 short code that addresses this user's public
+   * portfolio at `/p/<shortCode>`. ALWAYS present on responses to
+   * authenticated users — `ensureShortCode` runs lazily on first GET
+   * /v1/me and backfills if missing. On anonymous lookups (via
+   * `getAssembledUserByShortCode`) it's also populated because the
+   * lookup is keyed by it.
+   */
+  shortCode: string;
   createdAt: string;
   updatedAt: string;
+}
+
+const DEFAULT_TEMPLATE_ID = 'classic';
+
+/**
+ * Allow-list of known templates. Matches the five components the frontend
+ * has built (`ClassicPortfolio`, `ModernTechPortfolio`, etc.). Keeping it
+ * here means the backend rejects an obviously-bogus templateId at write
+ * time instead of letting it stick and surprising the renderer.
+ *
+ * Add new ids here when we add new template components.
+ */
+export const KNOWN_TEMPLATE_IDS = [
+  'classic',
+  'modern-tech',
+  'creative',
+  'minimalist',
+  'corporate',
+] as const;
+export type KnownTemplateId = (typeof KNOWN_TEMPLATE_IDS)[number];
+
+export function isKnownTemplateId(id: string): id is KnownTemplateId {
+  return (KNOWN_TEMPLATE_IDS as readonly string[]).includes(id);
 }
 
 // Wire (frontend Zod enum) ↔ DB (Postgres pg_enum) bidirectional maps.
@@ -112,32 +154,55 @@ const LANGUAGE_LEVEL_FROM_DB = {
 // Read
 // ---------------------------------------------------------------------------
 
+/**
+ * Authenticated read: load the assembled user for the current session.
+ *
+ * Also opportunistically backfills the portfolio's `shortCode` if missing
+ * — see `ensureShortCode` for why this happens here instead of at signup.
+ * The extra write is gated on the cheapest possible "is it already
+ * populated?" check, so cost is one boolean condition for the 99%
+ * (already-populated) case.
+ */
 export async function getAssembledUser(userId: string): Promise<AssembledUser | null> {
-  return assembleFromProfileRow(await loadProfileBy({ userId }));
+  const profile = await loadProfileByUserId(userId);
+  if (!profile) return null;
+  // Ensure a short_code exists before we assemble so the response always
+  // carries one. `ensureShortCode` is idempotent and short-circuits on
+  // the common case where the value is already populated.
+  await ensureShortCode(userId);
+  return assembleFromProfileRow(profile);
 }
 
 /**
- * Public lookup by username. Used by the unauthenticated /v1/public/:username
- * route. Returns null on miss; the caller decides whether that's a 404.
+ * Public anonymous read: by short code, used by `GET /v1/p/:code`.
  *
- * Phase 1.1 has no soft-private mode — if a row exists, it's reachable.
- * Switching that later is one extra `WHERE is_public = true` clause here.
+ * Joins `portfolios` → `profiles` so we only need one round-trip for the
+ * lookup itself; the assemble step then does the usual fan-out. Returns
+ * null on miss; the caller turns that into a 404.
+ *
+ * Caching is *not* applied here — the route layer wraps this call with
+ * the Redis short-code cache because that's where the ETag / response
+ * shape decisions live.
  */
-export async function getAssembledUserByUsername(
-  username: string,
+export async function getAssembledUserByShortCode(
+  shortCode: string,
 ): Promise<AssembledUser | null> {
-  return assembleFromProfileRow(await loadProfileBy({ username }));
+  const db = getDb();
+  const [row] = await db
+    .select({ userId: portfolios.userId })
+    .from(portfolios)
+    .where(eq(portfolios.shortCode, shortCode))
+    .limit(1);
+  if (!row) return null;
+  const profile = await loadProfileByUserId(row.userId);
+  return assembleFromProfileRow(profile);
 }
 
-type ProfileRow = Awaited<ReturnType<typeof loadProfileBy>>;
+type ProfileRow = Awaited<ReturnType<typeof loadProfileByUserId>>;
 
-async function loadProfileBy(lookup: { userId: string } | { username: string }) {
+async function loadProfileByUserId(userId: string) {
   const db = getDb();
-  const where =
-    'userId' in lookup
-      ? eq(profiles.userId, lookup.userId)
-      : eq(profiles.username, lookup.username);
-  const [row] = await db.select().from(profiles).where(where).limit(1);
+  const [row] = await db.select().from(profiles).where(eq(profiles.userId, userId)).limit(1);
   return row ?? null;
 }
 
@@ -146,15 +211,39 @@ async function assembleFromProfileRow(profile: ProfileRow): Promise<AssembledUse
   const userId = profile.userId;
   const db = getDb();
 
-  const [skillRows, expRows, eduRows, projRows, certRows, achRows, langRows] = await Promise.all([
-    db.select().from(skills).where(eq(skills.userId, userId)).orderBy(skills.position),
-    db.select().from(experiences).where(eq(experiences.userId, userId)).orderBy(experiences.position_order),
-    db.select().from(educations).where(eq(educations.userId, userId)).orderBy(educations.position_order),
-    db.select().from(projects).where(eq(projects.userId, userId)).orderBy(projects.position_order),
-    db.select().from(certifications).where(eq(certifications.userId, userId)).orderBy(certifications.position_order),
-    db.select().from(achievements).where(eq(achievements.userId, userId)).orderBy(achievements.position_order),
-    db.select().from(languages).where(eq(languages.userId, userId)).orderBy(languages.position_order),
-  ]);
+  // Fan-out: every child table + the user's portfolio row (for activeTemplate + shortCode).
+  // The portfolio query is a one-row LIMIT so the extra round-trip is cheap.
+  const [skillRows, expRows, eduRows, projRows, certRows, achRows, langRows, portfolioRows] =
+    await Promise.all([
+      db.select().from(skills).where(eq(skills.userId, userId)).orderBy(skills.position),
+      db.select().from(experiences).where(eq(experiences.userId, userId)).orderBy(experiences.position_order),
+      db.select().from(educations).where(eq(educations.userId, userId)).orderBy(educations.position_order),
+      db.select().from(projects).where(eq(projects.userId, userId)).orderBy(projects.position_order),
+      db.select().from(certifications).where(eq(certifications.userId, userId)).orderBy(certifications.position_order),
+      db.select().from(achievements).where(eq(achievements.userId, userId)).orderBy(achievements.position_order),
+      db.select().from(languages).where(eq(languages.userId, userId)).orderBy(languages.position_order),
+      db
+        .select({ templateId: portfolios.templateId, shortCode: portfolios.shortCode })
+        .from(portfolios)
+        .where(eq(portfolios.userId, userId))
+        .limit(1),
+    ]);
+
+  // Always resolve to a known template id. If the row has a stale/typo'd
+  // value (shouldn't happen with the write-time guard but defensive coding
+  // is cheap), fall back to the default instead of breaking the renderer.
+  const rawTemplateId = portfolioRows[0]?.templateId ?? DEFAULT_TEMPLATE_ID;
+  const activeTemplate: string = isKnownTemplateId(rawTemplateId)
+    ? rawTemplateId
+    : DEFAULT_TEMPLATE_ID;
+
+  // Short code should always be present here because all read paths
+  // (authenticated GET /v1/me, public /v1/p/:code) ensure it before
+  // calling. The empty-string fallback is defensive in case someone
+  // calls this directly without going through `ensureShortCode` — the
+  // response shape stays valid and the frontend gets a tell-tale empty
+  // string instead of `undefined` + a runtime TypeError.
+  const shortCode = portfolioRows[0]?.shortCode ?? '';
 
   return {
     id: profile.userId,
@@ -234,6 +323,8 @@ async function assembleFromProfileRow(profile: ProfileRow): Promise<AssembledUse
       level: LANGUAGE_LEVEL_FROM_DB[row.level],
       certification: row.certification ?? '',
     })),
+    activeTemplate,
+    shortCode,
     createdAt: profile.createdAt.toISOString(),
     updatedAt: profile.updatedAt.toISOString(),
   };
@@ -501,96 +592,298 @@ export class ProfileNotFoundError extends Error {
   }
 }
 
-/**
- * Username already claimed by someone else (or this same user — no-op'd at
- * the route layer so the caller doesn't have to handle that edge case).
- *
- * Lives here so route handlers can `catch` it specifically and return a
- * structured 409 instead of leaking the raw 23505 from postgres.
- */
-export class UsernameTakenError extends Error {
-  username: string;
-  constructor(username: string) {
-    super(`Username "${username}" is already taken`);
-    this.name = 'UsernameTakenError';
-    this.username = username;
-  }
-}
-
 // ---------------------------------------------------------------------------
-// Phase 1.1 — username operations
+// Phase 1.2 — portfolio template + short-code operations
 // ---------------------------------------------------------------------------
 
 /**
- * Atomically update a user's username (the slug behind /spotlight/<username>).
+ * Set (or insert) the user's active portfolio template.
  *
- * Caller MUST have already passed `username` through validateUsername() —
- * we don't re-run that here because the route layer needs the structured
- * error codes anyway, and a second check would just be wasted CPU.
+ * The public URL renders whatever this row says. Users pick from the
+ * template gallery; clicking "Use This Template" calls this.
  *
- * Idempotent: if the username already belongs to this user, no error.
+ * Schema note: portfolios.slug is NOT NULL but otherwise unused — we
+ * hard-code 'default' as the slug on insert. The `(user_id, slug)` unique
+ * index still prevents duplicate rows per user, and changing this when we
+ * add multiple-portfolios-per-user later is a separate migration.
  *
- * Throws:
- *   - UsernameTakenError if someone else owns it (unique-violation 23505)
- *   - ProfileNotFoundError if the user has no profiles row yet
+ * Side effect: the row's `updatedAt` bumps, which invalidates the public
+ * short-code cache (we delete the cache key by short code at the route
+ * layer after this returns).
  *
- * Returns the row's new updatedAt so the frontend can decide whether to
- * bust its cache.
+ * Caller MUST have validated `templateId` against KNOWN_TEMPLATE_IDS.
  */
-export async function updateUsername(
+export async function setActiveTemplate(
   userId: string,
-  username: string,
-): Promise<{ username: string; updatedAt: Date }> {
+  templateId: string,
+): Promise<{ templateId: string; shortCode: string; updatedAt: Date }> {
   const db = getDb();
 
-  try {
-    const [updated] = await db
-      .update(profiles)
-      .set({ username, updatedAt: new Date() })
-      .where(eq(profiles.userId, userId))
-      .returning({ username: profiles.username, updatedAt: profiles.updatedAt });
-
-    if (!updated) {
-      throw new ProfileNotFoundError(userId);
-    }
-    return updated;
-  } catch (err) {
-    // 23505 = unique_violation. We assume it was the username unique index
-    // because that's the only one this update could possibly conflict with.
-    const code = (err as { code?: string })?.code;
-    if (code === '23505') {
-      throw new UsernameTakenError(username);
-    }
-    throw err;
+  // Try update first (common case: row already exists from a previous selection).
+  const updated = await db
+    .update(portfolios)
+    .set({ templateId, updatedAt: new Date() })
+    .where(eq(portfolios.userId, userId))
+    .returning({
+      templateId: portfolios.templateId,
+      shortCode: portfolios.shortCode,
+      updatedAt: portfolios.updatedAt,
+    });
+  if (updated.length > 0) {
+    const row = updated[0]!;
+    // Backfill short code if this is a legacy row created before Phase 1.2.
+    // Doing it here keeps the API contract honest: callers always get a
+    // non-empty short code in the response.
+    const shortCode = row.shortCode ?? (await ensureShortCode(userId));
+    return { templateId: row.templateId, shortCode, updatedAt: row.updatedAt };
   }
+
+  // No row yet — insert one. This is the path a new user takes the first
+  // time they pick a template (the signup trigger creates `profiles` but
+  // not `portfolios`). Mint a short code in the same insert so we don't
+  // need a follow-up UPDATE.
+  const shortCode = await mintUniqueShortCode();
+  const inserted = await db
+    .insert(portfolios)
+    .values({
+      userId,
+      slug: 'default',
+      templateId,
+      shortCode,
+      isPublished: true,
+      publishedAt: new Date(),
+    })
+    .returning({
+      templateId: portfolios.templateId,
+      shortCode: portfolios.shortCode,
+      updatedAt: portfolios.updatedAt,
+    });
+  const row = inserted[0]!;
+  return {
+    templateId: row.templateId,
+    shortCode: row.shortCode ?? shortCode,
+    updatedAt: row.updatedAt,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Short-code lifecycle
+// ---------------------------------------------------------------------------
+
+/**
+ * Maximum number of generation attempts before we give up. With a 7-char
+ * Base62 alphabet (≈3.5 trillion addresses) the collision probability
+ * after a million issued codes is still vanishingly small, so the loop
+ * will essentially never re-enter. We cap iterations as a safety net so a
+ * misconfigured DB (e.g. unique index missing) doesn't spin forever.
+ */
+const MAX_SHORT_CODE_RETRIES = 8;
+
+/**
+ * Generate a Base62 short code and confirm uniqueness against the DB.
+ *
+ * Why a probe-then-insert pattern instead of relying on the unique
+ * constraint to surface a collision?
+ * ----------------------------------
+ * Two reasons:
+ *   1. The function is called in contexts where we *don't* yet know
+ *      which row will eventually carry the value (e.g. ensureShortCode
+ *      generates the code first, then atomically slots it into an
+ *      already-existing row). Letting the constraint reject the value
+ *      forces us to wrap the whole insert/update in a retry loop,
+ *      complicating the upstream callsites.
+ *   2. A "probe" hits Postgres' unique index directly (an index-only
+ *      scan), so the cost is one btree descent (≈microseconds), not a
+ *      full insert + rollback.
+ *
+ * Race condition note
+ * -------------------
+ * Two concurrent callers *could* probe the same code, both see "not
+ * taken", and one of them then fails on insert. We handle that case at
+ * the actual insert/update sites by catching 23505 and retrying — see
+ * `ensureShortCode` below.
+ */
+async function mintUniqueShortCode(): Promise<string> {
+  const db = getDb();
+
+  for (let i = 0; i < MAX_SHORT_CODE_RETRIES; i++) {
+    const candidate = generateShortCode();
+    const [hit] = await db
+      .select({ shortCode: portfolios.shortCode })
+      .from(portfolios)
+      .where(eq(portfolios.shortCode, candidate))
+      .limit(1);
+    if (!hit) return candidate;
+  }
+
+  throw new Error(
+    `Failed to mint a unique short code after ${MAX_SHORT_CODE_RETRIES} attempts. ` +
+      'Check that the partial unique index on portfolios.short_code exists, and ' +
+      'consider growing SHORT_CODE_LENGTH if the address space is genuinely exhausted.',
+  );
 }
 
 /**
- * Cheap availability probe — used by the "Is this username available?"
- * autocomplete in the share UI. Caller MUST have already validated format.
+ * Ensure the calling user has a portfolio row with a populated short code.
+ * Returns the code.
  *
- * Three return cases:
- *   - 'available' — nobody owns it
- *   - 'taken_by_self' — current user already owns it (treated as success)
- *   - 'taken' — someone else owns it
+ * Three cases:
+ *   1. Row exists with a code → return it (fast path, one SELECT).
+ *   2. Row exists without a code (legacy) → UPDATE with a fresh code.
+ *   3. No row at all → INSERT with default template + fresh code.
  *
- * The 'taken_by_self' distinction matters because the share UI shouldn't
- * flag "this is your current username" as an error.
+ * Cases 2 and 3 race-recover via the unique-violation catch: if another
+ * concurrent request inserted/updated first, we re-read and use the
+ * winner's code. This keeps the contract idempotent under bursty load
+ * (e.g. an SPA firing two GETs in quick succession at login).
  */
-export async function checkUsernameAvailability(
-  username: string,
-  currentUserId: string,
-): Promise<'available' | 'taken_by_self' | 'taken'> {
+export async function ensureShortCode(userId: string): Promise<string> {
   const db = getDb();
-  const [row] = await db
-    .select({ userId: profiles.userId })
-    .from(profiles)
-    .where(eq(profiles.username, username))
+
+  for (let attempt = 0; attempt < MAX_SHORT_CODE_RETRIES; attempt++) {
+    const [existing] = await db
+      .select({ shortCode: portfolios.shortCode })
+      .from(portfolios)
+      .where(eq(portfolios.userId, userId))
+      .limit(1);
+
+    // Case 1: row + code present. Done.
+    if (existing?.shortCode) return existing.shortCode;
+
+    const candidate = await mintUniqueShortCode();
+
+    try {
+      // Case 2: row exists but code is null. UPDATE.
+      if (existing) {
+        const [updated] = await db
+          .update(portfolios)
+          .set({ shortCode: candidate, updatedAt: new Date() })
+          .where(eq(portfolios.userId, userId))
+          .returning({ shortCode: portfolios.shortCode });
+        if (updated?.shortCode) return updated.shortCode;
+        // Fell through (shouldn't happen unless the row was deleted
+        // mid-flight). Retry.
+        continue;
+      }
+
+      // Case 3: no row at all. INSERT with sensible defaults.
+      const [inserted] = await db
+        .insert(portfolios)
+        .values({
+          userId,
+          slug: 'default',
+          shortCode: candidate,
+          templateId: DEFAULT_TEMPLATE_ID,
+          isPublished: true,
+          publishedAt: new Date(),
+        })
+        .returning({ shortCode: portfolios.shortCode });
+      if (inserted?.shortCode) return inserted.shortCode;
+    } catch (err) {
+      // 23505 = unique_violation. Either another request beat us to the
+      // INSERT (case 3) or our candidate collided with another row's
+      // newly-claimed code (case 2). Both resolve the same way: loop
+      // and re-read.
+      const code = (err as { code?: string })?.code;
+      if (code === '23505') continue;
+      throw err;
+    }
+  }
+
+  throw new Error(
+    `Failed to ensure short code for user ${userId} after ${MAX_SHORT_CODE_RETRIES} attempts.`,
+  );
+}
+
+/**
+ * Issue a brand-new short code for the user's portfolio, retiring the
+ * old one. The previous short code stops working immediately at the DB
+ * layer; we also explicitly invalidate the Redis cache entry so cached
+ * lookups for the old code start hitting the (now-empty) DB and miss.
+ *
+ * Use case: user posted their link to LinkedIn but later wants to
+ * "rotate" it (e.g. after taking the portfolio down for a refresh).
+ *
+ * Returns the new code and the row's new updatedAt (useful for ETag).
+ */
+export async function regenerateShortCode(
+  userId: string,
+): Promise<{ shortCode: string; updatedAt: Date }> {
+  const db = getDb();
+  const cache = getCache();
+
+  // First read the existing code so we know what to evict from cache.
+  const [existing] = await db
+    .select({ shortCode: portfolios.shortCode })
+    .from(portfolios)
+    .where(eq(portfolios.userId, userId))
     .limit(1);
 
-  if (!row) return 'available';
-  if (row.userId === currentUserId) return 'taken_by_self';
-  return 'taken';
+  for (let attempt = 0; attempt < MAX_SHORT_CODE_RETRIES; attempt++) {
+    const candidate = await mintUniqueShortCode();
+
+    try {
+      // Update the existing row if present, otherwise insert a new
+      // default portfolio with the new code. Both paths converge on
+      // the same return shape.
+      if (existing) {
+        const [updated] = await db
+          .update(portfolios)
+          .set({ shortCode: candidate, updatedAt: new Date() })
+          .where(eq(portfolios.userId, userId))
+          .returning({ shortCode: portfolios.shortCode, updatedAt: portfolios.updatedAt });
+        if (!updated?.shortCode) continue;
+        // Evict the old key so the next anonymous lookup correctly 404s.
+        if (existing.shortCode) {
+          await cache.del(cacheKeys.shortCode(existing.shortCode));
+        }
+        return { shortCode: updated.shortCode, updatedAt: updated.updatedAt };
+      }
+
+      const [inserted] = await db
+        .insert(portfolios)
+        .values({
+          userId,
+          slug: 'default',
+          shortCode: candidate,
+          templateId: DEFAULT_TEMPLATE_ID,
+          isPublished: true,
+          publishedAt: new Date(),
+        })
+        .returning({ shortCode: portfolios.shortCode, updatedAt: portfolios.updatedAt });
+      if (inserted?.shortCode) {
+        return { shortCode: inserted.shortCode, updatedAt: inserted.updatedAt };
+      }
+    } catch (err) {
+      const code = (err as { code?: string })?.code;
+      if (code === '23505') continue;
+      throw err;
+    }
+  }
+
+  throw new Error(
+    `Failed to regenerate short code for user ${userId} after ${MAX_SHORT_CODE_RETRIES} attempts.`,
+  );
+}
+
+/**
+ * Invalidate the public-lookup cache entry for a user's short code.
+ * Call after any mutation that affects the assembled-user response
+ * (saveAssembledUser, setActiveTemplate, avatar upload, etc.) so the
+ * anonymous viewer sees fresh data instead of a 60s stale snapshot.
+ *
+ * Soft-fails by design: a missing row, a missing code, and a Redis hiccup
+ * are all "ignore and move on". The TTL upper-bounds staleness anyway.
+ */
+export async function invalidateShortCodeCache(userId: string): Promise<void> {
+  const db = getDb();
+  const [row] = await db
+    .select({ shortCode: portfolios.shortCode })
+    .from(portfolios)
+    .where(eq(portfolios.userId, userId))
+    .limit(1);
+  if (!row?.shortCode) return;
+  await getCache().del(cacheKeys.shortCode(row.shortCode));
 }
 
 // ---------------------------------------------------------------------------

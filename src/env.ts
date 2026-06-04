@@ -33,6 +33,22 @@ const EnvSchema = z.object({
 
   // Postgres
   DATABASE_URL: z.string().url().optional(),
+
+  // Upstash Redis (used as a hot cache in front of `/v1/p/:code`
+  // lookups so anonymous portfolio views are served sub-ms when
+  // already cached). Both must be set together, or neither — the
+  // cache layer no-ops cleanly when unset so local dev works without
+  // a Redis dependency.
+  UPSTASH_REDIS_REST_URL: z
+    .string()
+    .url()
+    .optional()
+    .transform((v) => (v && !v.startsWith('PASTE_') ? v : undefined)),
+  UPSTASH_REDIS_REST_TOKEN: z
+    .string()
+    .min(1)
+    .optional()
+    .transform((v) => (v && !v.startsWith('PASTE_') ? v : undefined)),
 });
 
 export type Env = z.infer<typeof EnvSchema>;

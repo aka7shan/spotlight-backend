@@ -9,8 +9,7 @@ import { accessLog } from './middleware/access-log.js';
 import type { AuthVariables } from './middleware/auth.js';
 import { healthRoutes } from './routes/health.js';
 import { meRoutes } from './routes/me.js';
-import { shareRoutes } from './routes/share.js';
-import { publicRoutes } from './routes/public.js';
+import { shortRoutes } from './routes/short.js';
 
 /**
  * Hard ceiling on request body size at the Hono layer.
@@ -103,11 +102,10 @@ export function buildApp() {
 
   app.route('/', healthRoutes);
   app.route('/v1/me', meRoutes);
-  // Phase 1.1: shareable public URLs.
-  // Auth'd self-management:  /v1/me/share/*
-  // Anonymous public lookup: /v1/public/:username
-  app.route('/v1/me/share', shareRoutes);
-  app.route('/v1/public', publicRoutes);
+  // Phase 1.2: anonymous public lookup by Base62 short code.
+  //   /v1/p/:code  →  the public portfolio for that code
+  // Mints + management of the code lives on /v1/me (see meRoutes).
+  app.route('/v1/p', shortRoutes);
 
   // -------------------------------------------------------------------------
   // 404 + error handler (must come last)

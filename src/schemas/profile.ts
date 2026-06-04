@@ -211,19 +211,18 @@ export type AchievementInput = z.infer<typeof AchievementSchema>;
 export type LanguageInput = z.infer<typeof LanguageSchema>;
 
 // ---------------------------------------------------------------------------
-// Phase 1.1 — share / public-username contract
+// Phase 1.2 — portfolio template contract
 // ---------------------------------------------------------------------------
-//
-// Zod validates the wire shape ONLY. Business rules (length, format, reserved
-// words, uniqueness) live in src/lib/slug.ts and the service layer. Keeping
-// the Zod-level check loose lets us return our own structured error codes
-// from validateUsername() instead of generic 422 messages.
 
-export const UpdateUsernameSchema = z.object({
-  username: z.string().min(1).max(64),
+/**
+ * PUT /v1/me/portfolio body. Persists which template the user wants
+ * their public URL to render with.
+ *
+ * Format-checked here; allow-list of known IDs is enforced at the
+ * service layer (KNOWN_TEMPLATE_IDS in services/profile.ts) so adding
+ * a new template doesn't require a schema bump.
+ */
+export const UpdateTemplateSchema = z.object({
+  templateId: z.string().min(1).max(64),
 });
-export type UpdateUsernameInput = z.infer<typeof UpdateUsernameSchema>;
-
-export const CheckUsernameQuerySchema = z.object({
-  username: z.string().min(1).max(64),
-});
+export type UpdateTemplateInput = z.infer<typeof UpdateTemplateSchema>;
