@@ -56,6 +56,27 @@ export const ALLOWED_AVATAR_MIME_TYPES = Object.keys(AVATAR_MIME_TO_EXT);
 /** Hard ceiling on uploaded avatar size. Tracks the platform body limit. */
 export const MAX_AVATAR_BYTES = 5 * 1024 * 1024;
 
+// Cover images share the same MIME palette as avatars (every browser-decodable
+// format), but get their own constant so we can tune them independently
+// later — e.g. accept AVIF, raise the size limit, or restrict to wide-aspect
+// types — without disturbing avatar behavior.
+const COVER_MIME_TO_EXT: Readonly<Record<string, string>> = Object.freeze({
+  'image/jpeg': 'jpg',
+  'image/png': 'png',
+  'image/webp': 'webp',
+  'image/gif': 'gif',
+});
+
+export const ALLOWED_COVER_MIME_TYPES = Object.keys(COVER_MIME_TO_EXT);
+
+/**
+ * Hard ceiling on uploaded cover size. Covers are usually landscape and
+ * larger than avatars, but we keep them within the same 5 MB envelope so
+ * the global 6 MB Hono body limit covers (pun unintended) multipart
+ * boundaries + form fields with room to spare.
+ */
+export const MAX_COVER_BYTES = 5 * 1024 * 1024;
+
 export class StorageError extends Error {
   status: number;
   constructor(message: string, status = 500) {
@@ -146,5 +167,90 @@ export async function deleteAvatar(userId: string): Promise<void> {
   if (removeError) {
     console.error('[storage] avatar remove failed', { userId, paths, error: removeError });
     throw new StorageError(`Avatar delete failed: ${removeError.message}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Cover operations
+// ---------------------------------------------------------------------------
+//
+// Structurally identical to the avatar helpers above, but kept as a separate
+// pair (not generalized into one `uploadImage(bucket, ...)`) for three
+// reasons:
+//   1. Error messages stay specific ("Cover exceeds 5 MB" vs a vague "Image").
+//   2. Each surface can evolve independently — covers may grow an AVIF
+//      allowance, a different size cap, or thumbnail post-processing.
+//   3. The call sites (routes/me.ts) read more clearly with a distinct verb.
+
+/**
+ * Upload (or replace) the current user's cover image.
+ *
+ * @returns The public CDN URL of the uploaded cover, with a cache-busting
+ *          `?v=<timestamp>` query string.
+ * @throws StorageError(413) if the file is too large.
+ * @throws StorageError(415) if the MIME type isn't allowed.
+ * @throws StorageError(500) on any other Supabase failure.
+ */
+export async function uploadCover(
+  userId: string,
+  bytes: Uint8Array,
+  contentType: string,
+): Promise<string> {
+  if (bytes.byteLength > MAX_COVER_BYTES) {
+    throw new StorageError(
+      `Cover exceeds ${Math.round(MAX_COVER_BYTES / 1024 / 1024)} MB limit.`,
+      413,
+    );
+  }
+  const ext = COVER_MIME_TO_EXT[contentType];
+  if (!ext) {
+    throw new StorageError(
+      `Unsupported cover type "${contentType}". Allowed: ${ALLOWED_COVER_MIME_TYPES.join(', ')}.`,
+      415,
+    );
+  }
+
+  // Same `cover.<ext>` deterministic-path scheme as avatars: re-uploads
+  // overwrite cleanly via upsert, the Storage browser stays tidy, and the
+  // bare URL is stable so caches and og:image references don't churn.
+  // The ?v=<ts> below handles cache busting after a re-upload.
+  const path = `${userId}/cover.${ext}`;
+
+  const client = getClient();
+  const { error } = await client.storage.from('covers').upload(path, bytes, {
+    contentType,
+    upsert: true,
+    cacheControl: '3600',
+  });
+  if (error) {
+    console.error('[storage] cover upload failed', { userId, error });
+    throw new StorageError(`Cover upload failed: ${error.message}`);
+  }
+
+  const { data: pub } = client.storage.from('covers').getPublicUrl(path);
+  return `${pub.publicUrl}?v=${Date.now()}`;
+}
+
+/**
+ * Remove the current user's cover image from Storage.
+ * No-op if no file exists (Supabase returns success on missing-path delete).
+ */
+export async function deleteCover(userId: string): Promise<void> {
+  const client = getClient();
+
+  const { data: files, error: listError } = await client.storage
+    .from('covers')
+    .list(userId);
+  if (listError) {
+    console.error('[storage] cover list failed', { userId, error: listError });
+    throw new StorageError(`Cover delete failed: ${listError.message}`);
+  }
+  if (!files || files.length === 0) return;
+
+  const paths = files.map((f) => `${userId}/${f.name}`);
+  const { error: removeError } = await client.storage.from('covers').remove(paths);
+  if (removeError) {
+    console.error('[storage] cover remove failed', { userId, paths, error: removeError });
+    throw new StorageError(`Cover delete failed: ${removeError.message}`);
   }
 }

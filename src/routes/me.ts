@@ -19,10 +19,14 @@ import {
 } from '../services/profile.js';
 import {
   ALLOWED_AVATAR_MIME_TYPES,
+  ALLOWED_COVER_MIME_TYPES,
   MAX_AVATAR_BYTES,
+  MAX_COVER_BYTES,
   StorageError,
   deleteAvatar,
+  deleteCover,
   uploadAvatar,
+  uploadCover,
 } from '../lib/storage.js';
 import { getDb } from '../lib/db.js';
 import { profiles } from '../db/schema.js';
@@ -65,6 +69,14 @@ const writeLimiter = rateLimitByUser({
 // loop or an attack.
 const avatarLimiter = rateLimitByUser({
   scope: 'me.avatar',
+  limit: 10,
+  windowMs: 60_000,
+});
+
+// Same shape as the avatar limiter — separate scope so a user iterating on
+// their cover can't burn through the avatar budget (or vice versa).
+const coverLimiter = rateLimitByUser({
+  scope: 'me.cover',
   limit: 10,
   windowMs: 60_000,
 });
@@ -272,6 +284,103 @@ meRoutes.delete('/avatar', avatarLimiter, async (c) => {
   await getDb()
     .update(profiles)
     .set({ avatarUrl: null, updatedAt: new Date() })
+    .where(eq(profiles.userId, bootstrap.userId));
+
+  void invalidateShortCodeCache(bootstrap.userId);
+
+  const user = await getAssembledUser(bootstrap.userId);
+  return c.json({ user });
+});
+
+// ---------------------------------------------------------------------------
+// Cover (Phase 1.0b — Supabase Storage)
+// ---------------------------------------------------------------------------
+//
+// Structurally identical to the avatar pair above. See that block for the
+// "why a dedicated endpoint" reasoning — it applies one-for-one here.
+//
+// POST   /v1/me/cover — multipart upload, replaces existing cover
+// DELETE /v1/me/cover — removes cover from Storage AND clears DB field
+// ---------------------------------------------------------------------------
+
+meRoutes.post('/cover', coverLimiter, async (c) => {
+  const bootstrap = authProfileBootstrap(c);
+  if (!bootstrap.email) {
+    throw new HTTPException(400, { message: 'Auth token is missing an email claim' });
+  }
+  await ensureProfile(bootstrap);
+
+  let body: Record<string, string | File | (string | File)[]>;
+  try {
+    body = await c.req.parseBody();
+  } catch (err) {
+    console.error('[me.cover] failed to parse multipart body', err);
+    throw new HTTPException(400, { message: 'Invalid multipart body' });
+  }
+
+  const raw = body.file;
+  const file = Array.isArray(raw) ? raw[0] : raw;
+  if (!file || typeof file === 'string') {
+    throw new HTTPException(400, {
+      message: 'Missing "file" field in multipart body',
+    });
+  }
+
+  if (file.size > MAX_COVER_BYTES) {
+    throw new HTTPException(413, {
+      message: `Cover exceeds ${Math.round(MAX_COVER_BYTES / 1024 / 1024)} MB limit.`,
+    });
+  }
+  if (!ALLOWED_COVER_MIME_TYPES.includes(file.type)) {
+    throw new HTTPException(415, {
+      message: `Unsupported cover type "${file.type}". Allowed: ${ALLOWED_COVER_MIME_TYPES.join(', ')}.`,
+    });
+  }
+
+  const buffer = new Uint8Array(await file.arrayBuffer());
+
+  let publicUrl: string;
+  try {
+    publicUrl = await uploadCover(bootstrap.userId, buffer, file.type);
+  } catch (err) {
+    if (err instanceof StorageError) {
+      throw new HTTPException(err.status as 413 | 415 | 500, { message: err.message });
+    }
+    throw err;
+  }
+
+  // Same column-only update as avatar: do NOT route through PUT /v1/me, which
+  // has unsaved-changes semantics on the frontend.
+  await getDb()
+    .update(profiles)
+    .set({ coverUrl: publicUrl, updatedAt: new Date() })
+    .where(eq(profiles.userId, bootstrap.userId));
+
+  void invalidateShortCodeCache(bootstrap.userId);
+
+  const user = await getAssembledUser(bootstrap.userId);
+  return c.json({ user, coverUrl: publicUrl });
+});
+
+meRoutes.delete('/cover', coverLimiter, async (c) => {
+  const bootstrap = authProfileBootstrap(c);
+  if (!bootstrap.email) {
+    throw new HTTPException(400, { message: 'Auth token is missing an email claim' });
+  }
+  await ensureProfile(bootstrap);
+
+  try {
+    await deleteCover(bootstrap.userId);
+  } catch (err) {
+    if (err instanceof StorageError) {
+      throw new HTTPException(err.status as 500, { message: err.message });
+    }
+    throw err;
+  }
+
+  await getDb()
+    .update(profiles)
+    .set({ coverUrl: null, updatedAt: new Date() })
     .where(eq(profiles.userId, bootstrap.userId));
 
   void invalidateShortCodeCache(bootstrap.userId);
