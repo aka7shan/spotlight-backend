@@ -1,3 +1,4 @@
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import { Hono } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
 import { cors } from 'hono/cors';
@@ -117,4 +118,100 @@ export function buildApp() {
   app.onError(errorHandler);
 
   return app;
+}
+
+// =============================================================================
+// Vercel Node-runtime serverless handler
+// =============================================================================
+//
+// Why is this here (and not only in api/index.ts)?
+// ------------------------------------------------
+// `@vercel/node` resolves the function entry for `/api` to whichever compiled
+// `.js` it can find under /var/task that matches its rewrite target — and on
+// some recent build runs that ends up being `/var/task/src/app.js`, not
+// `/var/task/api/index.js`. When the chosen entry's default export isn't a
+// function, the runtime aborts with:
+//
+//   "Invalid export found in module \"/var/task/src/app.js\".
+//    The default export must be a function or server."
+//
+// We can't reliably force @vercel/node to pick api/index.js — `functions` and
+// `rewrites` together aren't enough on its own. So we make `src/app.ts` itself
+// a valid serverless function entry and have `api/index.ts` re-export from it.
+// Either resolution path now lands on the same working handler.
+//
+// The handler is the same Node↔Web adapter `hono/vercel` would give us on
+// the Edge runtime, written manually for the Node runtime (where Vercel hands
+// us IncomingMessage / ServerResponse instead of a Web Request).
+// =============================================================================
+
+const _coldStart = Date.now();
+let _vercelApp: ReturnType<typeof buildApp> | undefined;
+
+function _getVercelApp() {
+  if (!_vercelApp) {
+    _vercelApp = buildApp();
+    console.log(`[boot] hono ready in ${Date.now() - _coldStart}ms`);
+  }
+  return _vercelApp;
+}
+
+function _readBody(req: IncomingMessage): Promise<Buffer> {
+  return new Promise<Buffer>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk: Buffer) => chunks.push(chunk));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+export const config = {
+  runtime: 'nodejs',
+  maxDuration: 30,
+};
+
+export default async function vercelNodeHandler(
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<void> {
+  try {
+    const proto = (req.headers['x-forwarded-proto'] as string | undefined) ?? 'https';
+    const host = req.headers.host ?? 'localhost';
+    const url = `${proto}://${host}${req.url ?? '/'}`;
+
+    const headers = new Headers();
+    for (const [key, value] of Object.entries(req.headers)) {
+      if (Array.isArray(value)) headers.set(key, value.join(', '));
+      else if (value !== undefined) headers.set(key, String(value));
+    }
+
+    const method = (req.method ?? 'GET').toUpperCase();
+    const hasBody = !['GET', 'HEAD', 'OPTIONS'].includes(method);
+    const body = hasBody ? await _readBody(req) : undefined;
+
+    const webReq = new Request(url, {
+      method,
+      headers,
+      body: body && body.length > 0 ? body : undefined,
+    });
+
+    const webRes = await _getVercelApp().fetch(webReq);
+
+    res.statusCode = webRes.status;
+    webRes.headers.forEach((value, key) => {
+      res.setHeader(key, value);
+    });
+
+    const buf = Buffer.from(await webRes.arrayBuffer());
+    res.end(buf);
+  } catch (err) {
+    console.error('[handler] error', err);
+    if (!res.headersSent) {
+      res.statusCode = 500;
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ error: { code: 500, message: 'Internal Server Error' } }));
+    } else {
+      res.end();
+    }
+  }
 }
