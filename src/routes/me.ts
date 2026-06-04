@@ -20,14 +20,22 @@ import {
 import {
   ALLOWED_AVATAR_MIME_TYPES,
   ALLOWED_COVER_MIME_TYPES,
+  ALLOWED_CV_MIME_TYPES,
   MAX_AVATAR_BYTES,
   MAX_COVER_BYTES,
+  MAX_CV_BYTES,
   StorageError,
+  cvMimeToExt,
   deleteAvatar,
   deleteCover,
+  deleteCv,
+  downloadCvBytes,
   uploadAvatar,
   uploadCover,
+  uploadCv,
 } from '../lib/storage.js';
+import { CvParseError, parseCv } from '../services/cv-parse.js';
+import { GeminiNotConfiguredError } from '../env.js';
 import { getDb } from '../lib/db.js';
 import { profiles } from '../db/schema.js';
 
@@ -79,6 +87,34 @@ const coverLimiter = rateLimitByUser({
   scope: 'me.cover',
   limit: 10,
   windowMs: 60_000,
+});
+
+// CV uploads are heavier still (4 MB files, Storage round-trip). 10/hour
+// is well above any legitimate user need (uploading once, maybe once
+// more after spotting a typo) and well below anything that could OOM
+// the function.
+const cvUploadLimiter = rateLimitByUser({
+  scope: 'me.cv.upload',
+  limit: 10,
+  windowMs: 60 * 60_000,
+});
+
+// Parse calls are by far the most expensive request in the system — each
+// one runs:
+//   - storage read of the CV bytes
+//   - PDF/DOCX text extraction
+//   - Gemini API call (1 input token ≈ 4 chars; a typical CV is ~2K-8K
+//     input tokens + ~1K output tokens)
+//
+// Gemini's free tier is 1500 req/day across the whole project; we want
+// to keep that budget for legitimate use plus 1.3 (chat). A single user
+// burning hundreds of parses to test the diff UI would empty the
+// budget. 5/hour + 20/day is generous for legitimate use, strict enough
+// to bound spend.
+const cvParseLimiter = rateLimitByUser({
+  scope: 'me.cv.parse',
+  limit: 5,
+  windowMs: 60 * 60_000,
 });
 
 /**
@@ -388,6 +424,292 @@ meRoutes.delete('/cover', coverLimiter, async (c) => {
   const user = await getAssembledUser(bootstrap.userId);
   return c.json({ user });
 });
+
+// ---------------------------------------------------------------------------
+// CV upload + AI parse (Phase 1.2)
+// ---------------------------------------------------------------------------
+//
+// Two-step flow:
+//
+//   1. POST /v1/me/cv          → multipart upload, stores file in private
+//                                bucket, records metadata on profile.
+//                                Returns the updated User.
+//
+//   2. POST /v1/me/cv/parse    → reads the uploaded file, extracts text,
+//                                runs Gemini structured extraction.
+//                                Returns the parsed JSON (without writing
+//                                to profile — the frontend handles
+//                                accept/reject + then PUTs /v1/me with
+//                                whatever the user accepted).
+//
+//   3. DELETE /v1/me/cv        → remove from Storage AND clear DB fields.
+//
+// Why two endpoints instead of one?
+//  - Parse is expensive and re-runnable. Decoupling means the UI can
+//    re-extract from an already-uploaded file without re-uploading.
+//  - Different rate limits apply (parse is much costlier than upload).
+//  - Errors split cleanly: upload errors are about IO/storage,
+//    parse errors are about extraction or AI.
+//
+// Why NOT auto-parse on upload?
+//  - The user might just want to store their CV file for "Download CV"
+//    on the public profile (Phase 2). Not every upload needs AI work.
+//  - Auto-parse couples a tight, fast operation (upload) to a slow,
+//    rate-limited one (parse); a failed parse would muddy the upload
+//    success state.
+// ---------------------------------------------------------------------------
+
+meRoutes.post('/cv', cvUploadLimiter, async (c) => {
+  const bootstrap = authProfileBootstrap(c);
+  if (!bootstrap.email) {
+    throw new HTTPException(400, { message: 'Auth token is missing an email claim' });
+  }
+  await ensureProfile(bootstrap);
+
+  let body: Record<string, string | File | (string | File)[]>;
+  try {
+    body = await c.req.parseBody();
+  } catch (err) {
+    console.error('[me.cv] failed to parse multipart body', err);
+    throw new HTTPException(400, { message: 'Invalid multipart body' });
+  }
+
+  const raw = body.file;
+  const file = Array.isArray(raw) ? raw[0] : raw;
+  if (!file || typeof file === 'string') {
+    throw new HTTPException(400, {
+      message: 'Missing "file" field in multipart body',
+    });
+  }
+
+  // Fast pre-checks before reading bytes into memory. Storage will
+  // re-validate but rejecting here cuts the function's memory peak
+  // for an obvious oversized request.
+  if (file.size > MAX_CV_BYTES) {
+    throw new HTTPException(413, {
+      message: `CV exceeds ${Math.round(MAX_CV_BYTES / 1024 / 1024)} MB limit.`,
+    });
+  }
+  if (!ALLOWED_CV_MIME_TYPES.includes(file.type)) {
+    throw new HTTPException(415, {
+      message: `Unsupported CV type "${file.type}". Allowed: PDF, DOCX.`,
+    });
+  }
+
+  const buffer = new Uint8Array(await file.arrayBuffer());
+
+  let uploaded: Awaited<ReturnType<typeof uploadCv>>;
+  try {
+    uploaded = await uploadCv(bootstrap.userId, buffer, file.type);
+  } catch (err) {
+    if (err instanceof StorageError) {
+      throw new HTTPException(err.status as 413 | 415 | 500, { message: err.message });
+    }
+    throw err;
+  }
+
+  // Store the metadata on the profile so the frontend can render
+  // "your CV is up to date" / "uploaded 2 days ago" etc. The signed
+  // URL itself is short-lived so we DON'T store it; we mint fresh
+  // ones on demand via a future GET /v1/me/cv/signed-url endpoint.
+  //
+  // Filename: prefer the original name (what the user sees in their
+  // downloads folder), capped at 500 chars to fit the DB column.
+  const originalName = (file.name ?? 'resume').slice(0, 500);
+
+  await getDb()
+    .update(profiles)
+    .set({
+      cvFileName: originalName,
+      cvFileUrl: uploaded.path,
+      cvFileSize: uploaded.size,
+      cvFileType: uploaded.contentType,
+      cvUploadedAt: new Date(),
+      updatedAt: new Date(),
+    })
+    .where(eq(profiles.userId, bootstrap.userId));
+
+  void invalidateShortCodeCache(bootstrap.userId);
+
+  const user = await getAssembledUser(bootstrap.userId);
+  return c.json({
+    user,
+    cv: {
+      fileName: originalName,
+      fileSize: uploaded.size,
+      fileType: uploaded.contentType,
+      signedUrl: uploaded.signedUrl,
+    },
+  });
+});
+
+/**
+ * POST /v1/me/cv/parse — read the user's stored CV and run AI extraction.
+ *
+ * Returns the structured profile JSON (matching the frontend Zod shape)
+ * but does NOT write it. The frontend renders a diff UI; only fields
+ * the user accepts are sent back via PUT /v1/me.
+ *
+ * Errors map to specific status codes so the frontend can render
+ * tailored copy:
+ *   - 404: no CV uploaded yet
+ *   - 415: legacy .doc file (we can't extract text)
+ *   - 422: CV had no extractable text (image-only PDF)
+ *   - 429: hit Gemini quota or our per-user limit
+ *   - 502: provider was transiently down
+ *   - 503: Gemini key not configured on the server
+ */
+meRoutes.post('/cv/parse', cvParseLimiter, async (c) => {
+  const bootstrap = authProfileBootstrap(c);
+  if (!bootstrap.email) {
+    throw new HTTPException(400, { message: 'Auth token is missing an email claim' });
+  }
+  await ensureProfile(bootstrap);
+
+  const t0 = process.hrtime.bigint();
+
+  // Look up the stored CV metadata. We need the content-type so we
+  // can pick the right extractor; we don't trust the filename's
+  // extension because users sometimes paste-rename.
+  const [row] = await getDb()
+    .select({
+      cvFileType: profiles.cvFileType,
+      cvFileUrl: profiles.cvFileUrl,
+    })
+    .from(profiles)
+    .where(eq(profiles.userId, bootstrap.userId))
+    .limit(1);
+
+  if (!row?.cvFileType) {
+    throw new HTTPException(404, { message: 'No CV uploaded yet.' });
+  }
+  const ext = cvMimeToExt(row.cvFileType);
+  if (!ext) {
+    // Stored content-type isn't on our allow-list. Shouldn't happen
+    // because upload validates, but defensive.
+    throw new HTTPException(415, {
+      message: 'Stored CV has an unsupported format. Please re-upload.',
+    });
+  }
+
+  // Read bytes server-side via the service role (RLS bypassed).
+  let bytes: Uint8Array | null;
+  try {
+    bytes = await downloadCvBytes(bootstrap.userId, ext);
+  } catch (err) {
+    if (err instanceof StorageError) {
+      throw new HTTPException(500, { message: err.message });
+    }
+    throw err;
+  }
+  if (!bytes) {
+    // DB says we have a CV but the file's gone from Storage. Should
+    // be impossible (we don't have an orphan-cleanup path that does
+    // this), but if it happens, surface a clean recovery instruction.
+    throw new HTTPException(404, {
+      message: 'CV file is missing from storage. Please re-upload.',
+    });
+  }
+  const tDownload = process.hrtime.bigint();
+
+  // Run the pipeline. CvParseError covers every expected failure mode;
+  // anything else is a 500.
+  let parsed: Awaited<ReturnType<typeof parseCv>>;
+  try {
+    parsed = await parseCv({ bytes, format: ext });
+  } catch (err) {
+    if (err instanceof GeminiNotConfiguredError) {
+      throw new HTTPException(503, {
+        message: 'AI parsing is not configured on this server.',
+      });
+    }
+    if (err instanceof CvParseError) {
+      throw new HTTPException(cvParseErrorStatus(err), { message: err.message });
+    }
+    throw err;
+  }
+
+  const tParse = process.hrtime.bigint();
+  const ms = (a: bigint, b: bigint) => Number((b - a) / 1_000_000n);
+
+  // Structured log so future cost-attribution dashboards can group by
+  // user/model/usage. Don't log the actual CV text or extracted JSON —
+  // that's PII.
+  console.log(
+    `[me.cv.parse] userId=${bootstrap.userId} model=${parsed.modelUsed}` +
+      ` in=${parsed.usage.inputTokens}t out=${parsed.usage.outputTokens}t` +
+      ` bytes=${parsed.inputBytes}${parsed.inputTruncated ? ' (truncated)' : ''}` +
+      ` dl=${ms(t0, tDownload)}ms parse=${ms(tDownload, tParse)}ms total=${ms(t0, tParse)}ms`,
+  );
+
+  return c.json({
+    extracted: parsed.data,
+    meta: {
+      modelUsed: parsed.modelUsed,
+      usage: parsed.usage,
+      inputTruncated: parsed.inputTruncated,
+      inputBytes: parsed.inputBytes,
+    },
+  });
+});
+
+meRoutes.delete('/cv', cvUploadLimiter, async (c) => {
+  const bootstrap = authProfileBootstrap(c);
+  if (!bootstrap.email) {
+    throw new HTTPException(400, { message: 'Auth token is missing an email claim' });
+  }
+  await ensureProfile(bootstrap);
+
+  try {
+    await deleteCv(bootstrap.userId);
+  } catch (err) {
+    if (err instanceof StorageError) {
+      throw new HTTPException(err.status as 500, { message: err.message });
+    }
+    throw err;
+  }
+
+  await getDb()
+    .update(profiles)
+    .set({
+      cvFileName: null,
+      cvFileUrl: null,
+      cvFileSize: null,
+      cvFileType: null,
+      cvUploadedAt: null,
+      updatedAt: new Date(),
+    })
+    .where(eq(profiles.userId, bootstrap.userId));
+
+  void invalidateShortCodeCache(bootstrap.userId);
+
+  const user = await getAssembledUser(bootstrap.userId);
+  return c.json({ user });
+});
+
+/**
+ * Map a CvParseError kind to an HTTP status. Kept as a function (not
+ * a constant table) so TS will yell if a new kind is added without a
+ * branch here.
+ */
+function cvParseErrorStatus(err: CvParseError): 415 | 422 | 429 | 500 | 502 {
+  switch (err.kind) {
+    case 'extractor-unsupported':
+      return 415; // legacy .doc, etc.
+    case 'extractor-no-text':
+      return 422; // PDF was scan-only, no extractable text
+    case 'llm-quota':
+      return 429;
+    case 'llm-policy':
+      return 422; // safety filter — same UX as "we couldn't process this"
+    case 'llm-transient':
+      return 502;
+    case 'extraction-failed':
+    case 'llm-invalid':
+    case 'llm-unknown':
+      return 500;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Portfolio template (Phase 1.2)

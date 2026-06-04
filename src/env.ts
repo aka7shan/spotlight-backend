@@ -49,6 +49,28 @@ const EnvSchema = z.object({
     .min(1)
     .optional()
     .transform((v) => (v && !v.startsWith('PASTE_') ? v : undefined)),
+
+  // Google Gemini (Phase 1.2 — CV parsing, and 1.3 — portfolio chat).
+  // Optional at startup so the rest of the API stays online even if the
+  // key isn't configured yet; routes that need it call `requireGemini()`
+  // and fail with a clean 503 when the key is missing.
+  //
+  // Get a key at https://aistudio.google.com → "Get API key". Free tier:
+  // 15 req/min, 1500 req/day, no card required.
+  GEMINI_API_KEY: z
+    .string()
+    .min(1)
+    .optional()
+    .transform((v) => (v && !v.startsWith('PASTE_') ? v : undefined)),
+
+  // Which Gemini model to use for structured-output extraction (CV
+  // parsing). 2.0-flash is a great default: free-tier-friendly, strong
+  // at JSON schema mode, and fast enough that a CV parse feels
+  // interactive (~3-6s end-to-end).
+  GEMINI_MODEL: z
+    .string()
+    .min(1)
+    .default('gemini-2.0-flash'),
 });
 
 export type Env = z.infer<typeof EnvSchema>;
@@ -109,5 +131,34 @@ export function requireSupabaseService(): { url: string; serviceRoleKey: string 
   return {
     url: env.SUPABASE_URL,
     serviceRoleKey: env.SUPABASE_SERVICE_ROLE_KEY,
+  };
+}
+
+/**
+ * Throw a typed error if the Gemini API key isn't configured. Used by the
+ * CV-parse and chat routes so a missing key surfaces as a clean 503
+ * "feature unavailable" instead of a confusing 500 from deep inside the
+ * Google SDK.
+ *
+ * We return the model name alongside the key so callers don't have to
+ * read `env` twice (and so swapping models later stays a one-env-var
+ * change with no code edits).
+ */
+export class GeminiNotConfiguredError extends Error {
+  constructor() {
+    super(
+      'Gemini API is not configured. Set GEMINI_API_KEY in the backend environment.',
+    );
+    this.name = 'GeminiNotConfiguredError';
+  }
+}
+
+export function requireGemini(): { apiKey: string; model: string } {
+  if (!env.GEMINI_API_KEY) {
+    throw new GeminiNotConfiguredError();
+  }
+  return {
+    apiKey: env.GEMINI_API_KEY,
+    model: env.GEMINI_MODEL,
   };
 }

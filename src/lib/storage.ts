@@ -77,6 +77,39 @@ export const ALLOWED_COVER_MIME_TYPES = Object.keys(COVER_MIME_TO_EXT);
  */
 export const MAX_COVER_BYTES = 5 * 1024 * 1024;
 
+// CVs — Phase 1.2.
+// Accepted formats: PDF (the overwhelming majority), DOCX (the common
+// Word format), and DOC (legacy Word — we accept the bytes but the text
+// extractor only handles DOCX, so DOC uploads will succeed but parse
+// will fail with a clear message). We DO NOT accept image-only PDFs at
+// the storage layer (no way to tell from MIME); the parser handles that
+// gracefully with a "we couldn't read text" error.
+const CV_MIME_TO_EXT: Readonly<Record<string, string>> = Object.freeze({
+  'application/pdf': 'pdf',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+  'application/msword': 'doc',
+});
+
+export const ALLOWED_CV_MIME_TYPES = Object.keys(CV_MIME_TO_EXT);
+
+/**
+ * Hard ceiling on uploaded CV size.
+ *
+ * Chosen at 4 MB because:
+ *   - Vercel Hobby has a 4.5 MB platform-level body limit; we want our
+ *     own limit to trip first with a clean 413 JSON envelope before
+ *     Vercel returns its opaque error.
+ *   - Real CVs are 50 KB – 2 MB. Anything > 4 MB is almost always a
+ *     scanned-image PDF (no text layer) that the parser can't read
+ *     anyway; rejecting at upload time saves the user a confusing
+ *     "we couldn't extract anything" message later.
+ */
+export const MAX_CV_BYTES = 4 * 1024 * 1024;
+
+/** How long a signed URL for the user's own CV stays valid. 10 min is
+ *  plenty for a "Download my CV" click + a quick AI-parse round-trip. */
+const CV_SIGNED_URL_TTL_SECONDS = 600;
+
 export class StorageError extends Error {
   status: number;
   constructor(message: string, status = 500) {
@@ -253,4 +286,183 @@ export async function deleteCover(userId: string): Promise<void> {
     console.error('[storage] cover remove failed', { userId, paths, error: removeError });
     throw new StorageError(`Cover delete failed: ${removeError.message}`);
   }
+}
+
+// ---------------------------------------------------------------------------
+// CV operations (Phase 1.2)
+// ---------------------------------------------------------------------------
+//
+// The `cvs` bucket is PRIVATE (see drizzle/0002_storage_buckets.sql). Two
+// implications vs the avatar/cover plumbing:
+//
+//   1. Reads need a SIGNED URL — there's no public CDN URL. We mint one
+//      with a 10-min TTL when the owner needs to download. The parse
+//      endpoint reads the file via the service-role client directly and
+//      never exposes the URL.
+//
+//   2. Storage path keeps the same `<userId>/<file>` shape so the
+//      Storage RLS policy (first folder segment = auth.uid()) still
+//      works when we later expose direct-from-browser uploads.
+
+export interface CvUploadResult {
+  /** Storage object path (e.g. "<userId>/resume.pdf"). Useful for the
+   *  parse step which reads the file by path via the service client. */
+  path: string;
+  /** Short-lived signed URL (TTL = CV_SIGNED_URL_TTL_SECONDS). The
+   *  frontend uses this for "Download my CV" — it expires fast, so
+   *  callers shouldn't try to persist it. */
+  signedUrl: string;
+  /** Final size after the round-trip. Always equals input bytes.length —
+   *  we surface it so callers don't have to track this themselves. */
+  size: number;
+  /** Echoed back so callers don't have to re-derive (and so we have a
+   *  single source of truth for what got written). */
+  contentType: string;
+}
+
+/**
+ * Upload (or replace) the current user's CV.
+ *
+ * Stored at `cvs/<userId>/resume.<ext>` with `upsert: true` so re-uploads
+ * overwrite cleanly. Same orphan-on-cross-format-swap caveat applies as
+ * with avatars (e.g. PDF → DOCX leaves the old PDF behind) — we'll
+ * sweep that during the storage-cleanup pass.
+ *
+ * @returns The Storage path + a short-lived signed URL.
+ * @throws StorageError(413) if the file exceeds MAX_CV_BYTES.
+ * @throws StorageError(415) if the MIME isn't on the allow-list.
+ * @throws StorageError(500) on any other Supabase failure.
+ */
+export async function uploadCv(
+  userId: string,
+  bytes: Uint8Array,
+  contentType: string,
+): Promise<CvUploadResult> {
+  if (bytes.byteLength > MAX_CV_BYTES) {
+    throw new StorageError(
+      `CV exceeds ${Math.round(MAX_CV_BYTES / 1024 / 1024)} MB limit.`,
+      413,
+    );
+  }
+  const ext = CV_MIME_TO_EXT[contentType];
+  if (!ext) {
+    throw new StorageError(
+      `Unsupported CV type "${contentType}". Allowed: PDF, DOCX.`,
+      415,
+    );
+  }
+
+  const path = `${userId}/resume.${ext}`;
+  const client = getClient();
+
+  // Private bucket → no cacheControl needed (the signed URL has its
+  // own TTL). Upsert true so re-uploads to the same path overwrite.
+  const { error } = await client.storage.from('cvs').upload(path, bytes, {
+    contentType,
+    upsert: true,
+  });
+  if (error) {
+    console.error('[storage] cv upload failed', { userId, error });
+    throw new StorageError(`CV upload failed: ${error.message}`);
+  }
+
+  const { data: signed, error: signedError } = await client.storage
+    .from('cvs')
+    .createSignedUrl(path, CV_SIGNED_URL_TTL_SECONDS);
+  if (signedError || !signed?.signedUrl) {
+    console.error('[storage] cv signed-url failed', { userId, error: signedError });
+    throw new StorageError(`CV upload succeeded but signed-URL minting failed.`);
+  }
+
+  return {
+    path,
+    signedUrl: signed.signedUrl,
+    size: bytes.byteLength,
+    contentType,
+  };
+}
+
+/**
+ * Read the raw bytes of a user's CV back out of Storage.
+ *
+ * Used by the parse pipeline: after the user has uploaded a CV, the
+ * parse endpoint fetches the bytes server-side (via the service-role
+ * client, bypassing RLS) and feeds them to the text extractor + LLM.
+ * We never hand these bytes to the visitor.
+ *
+ * Returns null if no CV exists at the expected path; the caller turns
+ * that into a clean 404 "upload a CV first" instead of letting the
+ * error bubble.
+ */
+export async function downloadCvBytes(
+  userId: string,
+  ext: 'pdf' | 'docx' | 'doc',
+): Promise<Uint8Array | null> {
+  const client = getClient();
+  const path = `${userId}/resume.${ext}`;
+  const { data, error } = await client.storage.from('cvs').download(path);
+  if (error) {
+    // Treat "not found" specifically so the route can return 404. Supabase
+    // gives us a 404 in error.message — checking the status field is more
+    // brittle than checking the message.
+    if (error.message?.toLowerCase().includes('not found')) return null;
+    console.error('[storage] cv download failed', { userId, error });
+    throw new StorageError(`CV download failed: ${error.message}`);
+  }
+  if (!data) return null;
+  const arrayBuf = await data.arrayBuffer();
+  return new Uint8Array(arrayBuf);
+}
+
+/**
+ * Mint a fresh signed URL for the user's CV. Useful if the original
+ * URL from upload expired before the user clicked it.
+ *
+ * Returns null if no CV exists, so the route can 404 cleanly.
+ */
+export async function getCvSignedUrl(
+  userId: string,
+  ext: 'pdf' | 'docx' | 'doc',
+): Promise<string | null> {
+  const client = getClient();
+  const path = `${userId}/resume.${ext}`;
+  const { data, error } = await client.storage
+    .from('cvs')
+    .createSignedUrl(path, CV_SIGNED_URL_TTL_SECONDS);
+  if (error || !data?.signedUrl) {
+    if (error?.message?.toLowerCase().includes('not found')) return null;
+    return null;
+  }
+  return data.signedUrl;
+}
+
+/**
+ * Remove the current user's CV from Storage.
+ * No-op if no file exists.
+ */
+export async function deleteCv(userId: string): Promise<void> {
+  const client = getClient();
+
+  const { data: files, error: listError } = await client.storage
+    .from('cvs')
+    .list(userId);
+  if (listError) {
+    console.error('[storage] cv list failed', { userId, error: listError });
+    throw new StorageError(`CV delete failed: ${listError.message}`);
+  }
+  if (!files || files.length === 0) return;
+
+  const paths = files.map((f) => `${userId}/${f.name}`);
+  const { error: removeError } = await client.storage.from('cvs').remove(paths);
+  if (removeError) {
+    console.error('[storage] cv remove failed', { userId, paths, error: removeError });
+    throw new StorageError(`CV delete failed: ${removeError.message}`);
+  }
+}
+
+/** Helper: derive the canonical extension we use on disk from a MIME. */
+export function cvMimeToExt(contentType: string): 'pdf' | 'docx' | 'doc' | null {
+  const ext = CV_MIME_TO_EXT[contentType];
+  if (ext === 'pdf' || ext === 'docx' || ext === 'doc') return ext;
+  return null;
 }
