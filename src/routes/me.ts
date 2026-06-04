@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
 import { zValidator } from '@hono/zod-validator';
 import { z } from 'zod';
+import { eq } from 'drizzle-orm';
 import { requireAuth, type AuthVariables } from '../middleware/auth.js';
 import { rateLimitByUser } from '../middleware/rate-limit.js';
 import { UpdateMeSchema } from '../schemas/profile.js';
@@ -11,6 +12,15 @@ import {
   ProfileNotFoundError,
   saveAssembledUser,
 } from '../services/profile.js';
+import {
+  ALLOWED_AVATAR_MIME_TYPES,
+  MAX_AVATAR_BYTES,
+  StorageError,
+  deleteAvatar,
+  uploadAvatar,
+} from '../lib/storage.js';
+import { getDb } from '../lib/db.js';
+import { profiles } from '../db/schema.js';
 
 /**
  * /v1/me — operations on the currently authenticated user's profile.
@@ -41,6 +51,16 @@ const readLimiter = rateLimitByUser({
 const writeLimiter = rateLimitByUser({
   scope: 'me.write',
   limit: 20,
+  windowMs: 60_000,
+});
+
+// Avatar uploads are heavier (file I/O + Storage round-trip) so we want a
+// tighter limit than the regular write path. 10/min easily handles a user
+// who's iterating on their avatar choice; anything faster than that is a
+// loop or an attack.
+const avatarLimiter = rateLimitByUser({
+  scope: 'me.avatar',
+  limit: 10,
   windowMs: 60_000,
 });
 
@@ -132,6 +152,113 @@ meRoutes.put(
     }
     throw err;
   }
+
+  const user = await getAssembledUser(bootstrap.userId);
+  return c.json({ user });
+});
+
+// ---------------------------------------------------------------------------
+// Avatar (Phase 1.0 — Supabase Storage)
+// ---------------------------------------------------------------------------
+//
+// POST   /v1/me/avatar — multipart upload, replaces existing avatar
+// DELETE /v1/me/avatar — removes avatar from Storage AND clears DB field
+//
+// We don't expose a GET because the avatar URL is already part of the
+// assembled User returned by GET /v1/me. Frontend just consumes that.
+//
+// Why a dedicated endpoint instead of overloading PUT /v1/me?
+//  - File uploads need multipart/form-data, not JSON
+//  - Atomic semantics: upload + DB update happen together or not at all
+//  - Tighter rate limit (avatar uploads are heavy; profile saves are cheap)
+//  - Lets the frontend show real upload progress without coupling to a
+//    full profile-save round-trip
+// ---------------------------------------------------------------------------
+
+meRoutes.post('/avatar', avatarLimiter, async (c) => {
+  const bootstrap = authProfileBootstrap(c);
+  if (!bootstrap.email) {
+    throw new HTTPException(400, { message: 'Auth token is missing an email claim' });
+  }
+  await ensureProfile(bootstrap);
+
+  // parseBody() returns the whole multipart payload. We only care about
+  // the "file" field. Hono types this as string | File | (string|File)[].
+  let body: Record<string, string | File | (string | File)[]>;
+  try {
+    body = await c.req.parseBody();
+  } catch (err) {
+    console.error('[me.avatar] failed to parse multipart body', err);
+    throw new HTTPException(400, { message: 'Invalid multipart body' });
+  }
+
+  const raw = body.file;
+  const file = Array.isArray(raw) ? raw[0] : raw;
+  if (!file || typeof file === 'string') {
+    throw new HTTPException(400, {
+      message: 'Missing "file" field in multipart body',
+    });
+  }
+
+  // Fast pre-checks before we read the bytes into memory. The Storage helper
+  // re-validates after upload but rejecting here keeps the function memory
+  // footprint smaller for obvious oversized requests.
+  if (file.size > MAX_AVATAR_BYTES) {
+    throw new HTTPException(413, {
+      message: `Avatar exceeds ${Math.round(MAX_AVATAR_BYTES / 1024 / 1024)} MB limit.`,
+    });
+  }
+  if (!ALLOWED_AVATAR_MIME_TYPES.includes(file.type)) {
+    throw new HTTPException(415, {
+      message: `Unsupported avatar type "${file.type}". Allowed: ${ALLOWED_AVATAR_MIME_TYPES.join(', ')}.`,
+    });
+  }
+
+  const buffer = new Uint8Array(await file.arrayBuffer());
+
+  let publicUrl: string;
+  try {
+    publicUrl = await uploadAvatar(bootstrap.userId, buffer, file.type);
+  } catch (err) {
+    if (err instanceof StorageError) {
+      throw new HTTPException(err.status as 413 | 415 | 500, { message: err.message });
+    }
+    throw err;
+  }
+
+  // Update profile.avatar_url. We deliberately do NOT touch the dedicated
+  // PUT /v1/me update path here — that endpoint has unsaved-changes
+  // semantics on the frontend, and we don't want the avatar upload to
+  // accidentally flush a half-edited form.
+  await getDb()
+    .update(profiles)
+    .set({ avatarUrl: publicUrl, updatedAt: new Date() })
+    .where(eq(profiles.userId, bootstrap.userId));
+
+  const user = await getAssembledUser(bootstrap.userId);
+  return c.json({ user, avatarUrl: publicUrl });
+});
+
+meRoutes.delete('/avatar', avatarLimiter, async (c) => {
+  const bootstrap = authProfileBootstrap(c);
+  if (!bootstrap.email) {
+    throw new HTTPException(400, { message: 'Auth token is missing an email claim' });
+  }
+  await ensureProfile(bootstrap);
+
+  try {
+    await deleteAvatar(bootstrap.userId);
+  } catch (err) {
+    if (err instanceof StorageError) {
+      throw new HTTPException(err.status as 500, { message: err.message });
+    }
+    throw err;
+  }
+
+  await getDb()
+    .update(profiles)
+    .set({ avatarUrl: null, updatedAt: new Date() })
+    .where(eq(profiles.userId, bootstrap.userId));
 
   const user = await getAssembledUser(bootstrap.userId);
   return c.json({ user });

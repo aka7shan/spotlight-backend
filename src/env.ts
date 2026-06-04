@@ -75,9 +75,23 @@ export function requireSupabaseAuth(): {
   };
 }
 
-// NOTE: requireSupabaseServiceRole() and requireDatabase() used to live here
-// but had no call sites. The DB connection reads env.DATABASE_URL directly
-// (see src/lib/db.ts), and nothing in Phase 0 needs the service role key —
-// our backend connects to Postgres as the pooler superuser and JWT-verifies
-// every request itself. Re-add them when a feature actually needs the
-// indirection.
+/**
+ * For server-side Supabase operations that need to bypass RLS — Storage
+ * uploads, admin actions, etc. NEVER expose this key to the frontend or
+ * to any code that runs in the browser.
+ *
+ * Returns BOTH the URL and the key because the supabase-js client needs
+ * the URL to know which project to talk to. They're a pair, not two
+ * independent secrets.
+ */
+export function requireSupabaseService(): { url: string; serviceRoleKey: string } {
+  if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) {
+    throw new Error(
+      'Supabase service env vars are not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.',
+    );
+  }
+  return {
+    url: env.SUPABASE_URL,
+    serviceRoleKey: env.SUPABASE_SERVICE_ROLE_KEY,
+  };
+}

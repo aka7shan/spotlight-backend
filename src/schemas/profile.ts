@@ -49,12 +49,22 @@ const optStr = z.string().max(2000).nullish();
 // string than reject the save. The frontend normalizes for display.
 const flexibleLink = z.string().max(2048).nullish();
 
-// Image fields can be either:
-//   - an http(s) URL (Unsplash sample data, future Supabase Storage)
+// Image fields used by content that's still on the data-URL path (project
+// thumbnails, etc.). Accepts:
+//   - an http(s) URL (Unsplash sample data, Supabase Storage public URL)
 //   - a `data:image/*;base64,...` URI (file upload via FileReader)
 //   - an empty string (no image yet) or null (column unset in DB)
 // 10MB cap keeps a runaway base64 blob from filling the request body indefinitely.
 const flexibleImage = z.string().max(10_000_000).nullish();
+
+// Strict URL field for content that's been migrated to Supabase Storage
+// (Phase 1.0: avatar, cover image). Once everything is a URL we can drop
+// flexibleImage entirely.
+//
+// We don't use .url() because some legitimate values are protocol-relative
+// or relative paths (rare for our use case, but future-proofs). The 2 KB
+// ceiling is generous: a normal Supabase public URL is < 200 chars.
+const imageUrl = z.string().max(2048).nullish();
 
 export const SocialLinksSchema = z
   .object({
@@ -172,8 +182,12 @@ export const UpdateMeSchema = z.object({
   phone: z.string().max(40).nullish(),
   location: z.string().max(200).nullish(),
   about: z.string().max(10000).nullish(),
-  avatar: flexibleImage,
-  coverImage: flexibleImage,
+  // avatar + coverImage have been migrated to Supabase Storage (Phase 1.0).
+  // They're URLs now, never data URIs. The dedicated POST /v1/me/avatar
+  // endpoint is the only path that writes to these — PUT /v1/me only
+  // accepts the URL the upload route returned.
+  avatar: imageUrl,
+  coverImage: imageUrl,
   socialLinks: SocialLinksSchema,
   cv: CvDataSchema,
 
