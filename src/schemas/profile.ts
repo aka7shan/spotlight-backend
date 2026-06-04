@@ -209,3 +209,21 @@ export type ProjectInput = z.infer<typeof ProjectSchema>;
 export type CertificationInput = z.infer<typeof CertificationSchema>;
 export type AchievementInput = z.infer<typeof AchievementSchema>;
 export type LanguageInput = z.infer<typeof LanguageSchema>;
+
+// ---------------------------------------------------------------------------
+// Phase 1.1 — share / public-username contract
+// ---------------------------------------------------------------------------
+//
+// Zod validates the wire shape ONLY. Business rules (length, format, reserved
+// words, uniqueness) live in src/lib/slug.ts and the service layer. Keeping
+// the Zod-level check loose lets us return our own structured error codes
+// from validateUsername() instead of generic 422 messages.
+
+export const UpdateUsernameSchema = z.object({
+  username: z.string().min(1).max(64),
+});
+export type UpdateUsernameInput = z.infer<typeof UpdateUsernameSchema>;
+
+export const CheckUsernameQuerySchema = z.object({
+  username: z.string().min(1).max(64),
+});

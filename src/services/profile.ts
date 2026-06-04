@@ -113,10 +113,38 @@ const LANGUAGE_LEVEL_FROM_DB = {
 // ---------------------------------------------------------------------------
 
 export async function getAssembledUser(userId: string): Promise<AssembledUser | null> {
-  const db = getDb();
+  return assembleFromProfileRow(await loadProfileBy({ userId }));
+}
 
-  const [profile] = await db.select().from(profiles).where(eq(profiles.userId, userId)).limit(1);
+/**
+ * Public lookup by username. Used by the unauthenticated /v1/public/:username
+ * route. Returns null on miss; the caller decides whether that's a 404.
+ *
+ * Phase 1.1 has no soft-private mode — if a row exists, it's reachable.
+ * Switching that later is one extra `WHERE is_public = true` clause here.
+ */
+export async function getAssembledUserByUsername(
+  username: string,
+): Promise<AssembledUser | null> {
+  return assembleFromProfileRow(await loadProfileBy({ username }));
+}
+
+type ProfileRow = Awaited<ReturnType<typeof loadProfileBy>>;
+
+async function loadProfileBy(lookup: { userId: string } | { username: string }) {
+  const db = getDb();
+  const where =
+    'userId' in lookup
+      ? eq(profiles.userId, lookup.userId)
+      : eq(profiles.username, lookup.username);
+  const [row] = await db.select().from(profiles).where(where).limit(1);
+  return row ?? null;
+}
+
+async function assembleFromProfileRow(profile: ProfileRow): Promise<AssembledUser | null> {
   if (!profile) return null;
+  const userId = profile.userId;
+  const db = getDb();
 
   const [skillRows, expRows, eduRows, projRows, certRows, achRows, langRows] = await Promise.all([
     db.select().from(skills).where(eq(skills.userId, userId)).orderBy(skills.position),
@@ -471,6 +499,98 @@ export class ProfileNotFoundError extends Error {
     this.name = 'ProfileNotFoundError';
     this.userId = userId;
   }
+}
+
+/**
+ * Username already claimed by someone else (or this same user — no-op'd at
+ * the route layer so the caller doesn't have to handle that edge case).
+ *
+ * Lives here so route handlers can `catch` it specifically and return a
+ * structured 409 instead of leaking the raw 23505 from postgres.
+ */
+export class UsernameTakenError extends Error {
+  username: string;
+  constructor(username: string) {
+    super(`Username "${username}" is already taken`);
+    this.name = 'UsernameTakenError';
+    this.username = username;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1.1 — username operations
+// ---------------------------------------------------------------------------
+
+/**
+ * Atomically update a user's username (the slug behind /spotlight/<username>).
+ *
+ * Caller MUST have already passed `username` through validateUsername() —
+ * we don't re-run that here because the route layer needs the structured
+ * error codes anyway, and a second check would just be wasted CPU.
+ *
+ * Idempotent: if the username already belongs to this user, no error.
+ *
+ * Throws:
+ *   - UsernameTakenError if someone else owns it (unique-violation 23505)
+ *   - ProfileNotFoundError if the user has no profiles row yet
+ *
+ * Returns the row's new updatedAt so the frontend can decide whether to
+ * bust its cache.
+ */
+export async function updateUsername(
+  userId: string,
+  username: string,
+): Promise<{ username: string; updatedAt: Date }> {
+  const db = getDb();
+
+  try {
+    const [updated] = await db
+      .update(profiles)
+      .set({ username, updatedAt: new Date() })
+      .where(eq(profiles.userId, userId))
+      .returning({ username: profiles.username, updatedAt: profiles.updatedAt });
+
+    if (!updated) {
+      throw new ProfileNotFoundError(userId);
+    }
+    return updated;
+  } catch (err) {
+    // 23505 = unique_violation. We assume it was the username unique index
+    // because that's the only one this update could possibly conflict with.
+    const code = (err as { code?: string })?.code;
+    if (code === '23505') {
+      throw new UsernameTakenError(username);
+    }
+    throw err;
+  }
+}
+
+/**
+ * Cheap availability probe — used by the "Is this username available?"
+ * autocomplete in the share UI. Caller MUST have already validated format.
+ *
+ * Three return cases:
+ *   - 'available' — nobody owns it
+ *   - 'taken_by_self' — current user already owns it (treated as success)
+ *   - 'taken' — someone else owns it
+ *
+ * The 'taken_by_self' distinction matters because the share UI shouldn't
+ * flag "this is your current username" as an error.
+ */
+export async function checkUsernameAvailability(
+  username: string,
+  currentUserId: string,
+): Promise<'available' | 'taken_by_self' | 'taken'> {
+  const db = getDb();
+  const [row] = await db
+    .select({ userId: profiles.userId })
+    .from(profiles)
+    .where(eq(profiles.username, username))
+    .limit(1);
+
+  if (!row) return 'available';
+  if (row.userId === currentUserId) return 'taken_by_self';
+  return 'taken';
 }
 
 // ---------------------------------------------------------------------------

@@ -9,6 +9,8 @@ import { accessLog } from './middleware/access-log.js';
 import type { AuthVariables } from './middleware/auth.js';
 import { healthRoutes } from './routes/health.js';
 import { meRoutes } from './routes/me.js';
+import { shareRoutes } from './routes/share.js';
+import { publicRoutes } from './routes/public.js';
 
 /**
  * Hard ceiling on request body size at the Hono layer.
@@ -101,6 +103,11 @@ export function buildApp() {
 
   app.route('/', healthRoutes);
   app.route('/v1/me', meRoutes);
+  // Phase 1.1: shareable public URLs.
+  // Auth'd self-management:  /v1/me/share/*
+  // Anonymous public lookup: /v1/public/:username
+  app.route('/v1/me/share', shareRoutes);
+  app.route('/v1/public', publicRoutes);
 
   // -------------------------------------------------------------------------
   // 404 + error handler (must come last)

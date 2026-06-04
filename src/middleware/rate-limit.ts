@@ -116,3 +116,19 @@ export function rateLimitByUser(
     },
   });
 }
+
+/**
+ * Convenience: rate-limit by client IP. For unauthenticated endpoints
+ * (e.g. the public profile lookup) where the user is anonymous.
+ *
+ * Note: behind Vercel/Cloudflare the "IP" is whatever the platform put in
+ * x-forwarded-for. That's good enough for casual abuse mitigation but isn't
+ * forge-proof — a determined attacker can spoof the header upstream of us
+ * if we accept it from anyone. Vercel sanitizes it for us, so for now this
+ * is fine.
+ */
+export function rateLimitByIp(
+  opts: Omit<RateLimitOptions, 'keyResolver'> & { scope: string },
+): MiddlewareHandler {
+  return rateLimit({ ...opts, keyResolver: defaultKey });
+}
