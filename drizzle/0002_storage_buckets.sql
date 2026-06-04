@@ -162,3 +162,20 @@ CREATE POLICY "cvs_owner_delete" ON storage.objects
     bucket_id = 'cvs'
     AND (storage.foldername(name))[1] = auth.uid()::text
   );
+
+-- ---------------------------------------------------------------------
+-- 3. One-time cleanup for any pre-1.0 data: URLs.
+--
+-- Phase 0 wrote avatars as `data:image/...;base64,...` strings directly
+-- into profiles.avatar_url. Phase 1.0 caps that column at 2 KB (URL only).
+-- An old data URL surviving in the DB would 422 the next PUT /v1/me from
+-- that user. We clear those out unconditionally — the user can re-upload
+-- via the new flow.
+-- ---------------------------------------------------------------------
+UPDATE public.profiles
+   SET avatar_url = NULL
+ WHERE avatar_url LIKE 'data:%';
+
+UPDATE public.profiles
+   SET cover_image_url = NULL
+ WHERE cover_image_url LIKE 'data:%';
