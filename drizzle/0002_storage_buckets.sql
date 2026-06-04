@@ -177,5 +177,5 @@ UPDATE public.profiles
  WHERE avatar_url LIKE 'data:%';
 
 UPDATE public.profiles
-   SET cover_image_url = NULL
- WHERE cover_image_url LIKE 'data:%';
+   SET cover_url = NULL
+ WHERE cover_url LIKE 'data:%';
