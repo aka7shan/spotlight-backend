@@ -35,7 +35,6 @@ import {
   uploadCv,
 } from '../lib/storage.js';
 import { CvParseError, parseCv } from '../services/cv-parse.js';
-import { GeminiNotConfiguredError } from '../env.js';
 import { getDb } from '../lib/db.js';
 import { profiles } from '../db/schema.js';
 
@@ -103,23 +102,26 @@ const cvUploadLimiter = rateLimitByUser({
 // one runs:
 //   - storage read of the CV bytes
 //   - PDF/DOCX text extraction
-//   - Gemini API call (1 input token ≈ 4 chars; a typical CV is ~2K-8K
-//     input tokens + ~1K output tokens)
+//   - LLM API call (Groq primary; ~2K-8K input tokens + ~1K output)
 //
-// Gemini's free tier is 1500 req/day across the whole project. 20/hour
-// per user gives plenty of headroom for testing without letting a single
-// user burn the whole daily budget if they leave a tab open.
+// We now route to Groq (free, 30 RPM, no daily cap on most models) with
+// Gemini as fallback. The roomier ceiling means we can let a user
+// iterate more freely while testing. 50/hour per user is still
+// comfortably below any single provider's RPM budget when summed
+// across users, but high enough that no realistic legitimate use
+// hits it.
 //
-// We override `userMessage` because users (very reasonably) confuse OUR
-// 429 with Gemini's quota — the error message has to make ownership
-// obvious or we get bug reports about Google's dashboard "lying".
+// We override `userMessage` because users routinely confuse OUR 429
+// with an upstream provider's quota — the error message has to make
+// ownership obvious or we get bug reports about provider dashboards
+// "lying".
 const cvParseLimiter = rateLimitByUser({
   scope: 'me.cv.parse',
-  limit: 20,
+  limit: 50,
   windowMs: 60 * 60_000,
   userMessage:
-    "You've reached our per-user limit of 20 AI parses per hour. " +
-    "(This is the Spotlight backend's limit, not Gemini's.)",
+    "You've reached our per-user limit of 50 AI parses per hour. " +
+    "(This is the Spotlight backend's limit, not the upstream AI provider's.)",
 });
 
 /**
@@ -617,17 +619,13 @@ meRoutes.post('/cv/parse', cvParseLimiter, async (c) => {
   }
   const tDownload = process.hrtime.bigint();
 
-  // Run the pipeline. CvParseError covers every expected failure mode;
-  // anything else is a 500.
+  // Run the pipeline. CvParseError covers every expected failure mode
+  // (including missing-provider, which the LLM layer surfaces via
+  // `llm-not-configured`). Anything else is a 500.
   let parsed: Awaited<ReturnType<typeof parseCv>>;
   try {
     parsed = await parseCv({ bytes, format: ext });
   } catch (err) {
-    if (err instanceof GeminiNotConfiguredError) {
-      throw new HTTPException(503, {
-        message: 'AI parsing is not configured on this server.',
-      });
-    }
     if (err instanceof CvParseError) {
       throw new HTTPException(cvParseErrorStatus(err), { message: err.message });
     }
@@ -638,10 +636,11 @@ meRoutes.post('/cv/parse', cvParseLimiter, async (c) => {
   const ms = (a: bigint, b: bigint) => Number((b - a) / 1_000_000n);
 
   // Structured log so future cost-attribution dashboards can group by
-  // user/model/usage. Don't log the actual CV text or extracted JSON —
-  // that's PII.
+  // user / provider / model / usage. Don't log the actual CV text or
+  // extracted JSON — that's PII.
   console.log(
-    `[me.cv.parse] userId=${bootstrap.userId} model=${parsed.modelUsed}` +
+    `[me.cv.parse] userId=${bootstrap.userId} provider=${parsed.provider}` +
+      ` model=${parsed.modelUsed}` +
       ` in=${parsed.usage.inputTokens}t out=${parsed.usage.outputTokens}t` +
       ` bytes=${parsed.inputBytes}${parsed.inputTruncated ? ' (truncated)' : ''}` +
       ` dl=${ms(t0, tDownload)}ms parse=${ms(tDownload, tParse)}ms total=${ms(t0, tParse)}ms`,
@@ -650,6 +649,7 @@ meRoutes.post('/cv/parse', cvParseLimiter, async (c) => {
   return c.json({
     extracted: parsed.data,
     meta: {
+      provider: parsed.provider,
       modelUsed: parsed.modelUsed,
       usage: parsed.usage,
       inputTruncated: parsed.inputTruncated,
@@ -697,7 +697,7 @@ meRoutes.delete('/cv', cvUploadLimiter, async (c) => {
  * a constant table) so TS will yell if a new kind is added without a
  * branch here.
  */
-function cvParseErrorStatus(err: CvParseError): 415 | 422 | 429 | 500 | 502 {
+function cvParseErrorStatus(err: CvParseError): 415 | 422 | 429 | 500 | 502 | 503 {
   switch (err.kind) {
     case 'extractor-unsupported':
       return 415; // legacy .doc, etc.
@@ -709,6 +709,8 @@ function cvParseErrorStatus(err: CvParseError): 415 | 422 | 429 | 500 | 502 {
       return 422; // safety filter — same UX as "we couldn't process this"
     case 'llm-transient':
       return 502;
+    case 'llm-not-configured':
+      return 503; // no provider key configured server-side
     case 'extraction-failed':
     case 'llm-invalid':
     case 'llm-unknown':

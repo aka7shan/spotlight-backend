@@ -30,11 +30,6 @@
  */
 
 import {
-  Type as GenAiType,
-  type Schema as GenAiSchema,
-} from '@google/genai';
-
-import {
   CvExtractionError,
   extractCvText,
   type CvExtractFormat,
@@ -42,7 +37,9 @@ import {
 import {
   generateStructured,
   LlmError,
+  type JsonSchema,
   type LlmUsage,
+  type ProviderName,
 } from '../lib/llm.js';
 
 // ---------------------------------------------------------------------------
@@ -149,6 +146,8 @@ export interface CvParseEnvelope {
   usage: LlmUsage;
   /** Model id that served the request. */
   modelUsed: string;
+  /** Which provider (`groq` | `gemini`) actually served the request. */
+  provider: ProviderName;
   /**
    * Whether the input text was truncated before being sent to the LLM
    * (e.g. a 50-page CV got cut to 200 KB). The frontend can show a
@@ -161,64 +160,67 @@ export interface CvParseEnvelope {
 }
 
 // ---------------------------------------------------------------------------
-// JSON schema for Gemini (mirrors CvParseResult)
+// JSON schema (provider-neutral, enforced at decode time)
 // ---------------------------------------------------------------------------
 //
-// Gemini will *enforce* this at decode time, so it's our load-bearing
-// contract — not just hints. A few deliberate choices:
+// Both providers we support enforce this at decode time — Groq via
+// tool-calling, Gemini via responseSchema — so it's our load-bearing
+// contract, not just hints. A few deliberate choices:
 //
 //  - Everything optional. Empty CVs and short ones must produce valid
 //    output without the model inventing data.
 //  - Enums encoded with `enum:` so the model can't return "completed"
 //    when we want "Completed" (the wire shape is case-sensitive).
-//  - `format: 'email'` etc. is NOT used — real CVs sometimes have
-//    valid emails the spec rejects (subaddressing with `+`, etc.).
-//    We accept whatever and let the frontend validator catch the rest.
-//  - No `description` field on the schema itself — Gemini doesn't read
-//    those at runtime. All hints live in the system prompt below.
+//  - `format: 'email'` etc. is deliberately NOT used — real CVs
+//    sometimes have valid emails the spec rejects (subaddressing
+//    with `+`, etc.). We accept whatever and let the frontend
+//    validator catch the rest.
+//  - We use OUR neutral `JsonSchema` type from `lib/llm.ts`, not the
+//    Gemini-specific `Schema`. The Gemini provider converts on the way
+//    out so we don't leak SDK shapes into the service layer.
 
-const cvParseSchema: GenAiSchema = {
-  type: GenAiType.OBJECT,
+const cvParseSchema: JsonSchema = {
+  type: 'object',
   properties: {
-    name: { type: GenAiType.STRING },
-    title: { type: GenAiType.STRING },
-    email: { type: GenAiType.STRING },
-    phone: { type: GenAiType.STRING },
-    location: { type: GenAiType.STRING },
-    about: { type: GenAiType.STRING },
+    name: { type: 'string' },
+    title: { type: 'string' },
+    email: { type: 'string' },
+    phone: { type: 'string' },
+    location: { type: 'string' },
+    about: { type: 'string' },
 
     socialLinks: {
-      type: GenAiType.OBJECT,
+      type: 'object',
       properties: {
-        linkedin: { type: GenAiType.STRING },
-        github: { type: GenAiType.STRING },
-        twitter: { type: GenAiType.STRING },
-        website: { type: GenAiType.STRING },
-        dribbble: { type: GenAiType.STRING },
-        behance: { type: GenAiType.STRING },
+        linkedin: { type: 'string' },
+        github: { type: 'string' },
+        twitter: { type: 'string' },
+        website: { type: 'string' },
+        dribbble: { type: 'string' },
+        behance: { type: 'string' },
       },
     },
 
     skills: {
-      type: GenAiType.ARRAY,
-      items: { type: GenAiType.STRING },
+      type: 'array',
+      items: { type: 'string' },
     },
 
     experience: {
-      type: GenAiType.ARRAY,
+      type: 'array',
       items: {
-        type: GenAiType.OBJECT,
+        type: 'object',
         properties: {
-          position: { type: GenAiType.STRING },
-          company: { type: GenAiType.STRING },
-          startDate: { type: GenAiType.STRING },
-          endDate: { type: GenAiType.STRING },
-          isPresent: { type: GenAiType.BOOLEAN },
-          description: { type: GenAiType.STRING },
-          location: { type: GenAiType.STRING },
+          position: { type: 'string' },
+          company: { type: 'string' },
+          startDate: { type: 'string' },
+          endDate: { type: 'string' },
+          isPresent: { type: 'boolean' },
+          description: { type: 'string' },
+          location: { type: 'string' },
           skills: {
-            type: GenAiType.ARRAY,
-            items: { type: GenAiType.STRING },
+            type: 'array',
+            items: { type: 'string' },
           },
         },
         required: ['position', 'company', 'startDate'],
@@ -226,20 +228,20 @@ const cvParseSchema: GenAiSchema = {
     },
 
     education: {
-      type: GenAiType.ARRAY,
+      type: 'array',
       items: {
-        type: GenAiType.OBJECT,
+        type: 'object',
         properties: {
-          degree: { type: GenAiType.STRING },
-          institution: { type: GenAiType.STRING },
-          startDate: { type: GenAiType.STRING },
-          endDate: { type: GenAiType.STRING },
-          isPresent: { type: GenAiType.BOOLEAN },
-          gpa: { type: GenAiType.STRING },
-          description: { type: GenAiType.STRING },
+          degree: { type: 'string' },
+          institution: { type: 'string' },
+          startDate: { type: 'string' },
+          endDate: { type: 'string' },
+          isPresent: { type: 'boolean' },
+          gpa: { type: 'string' },
+          description: { type: 'string' },
           achievements: {
-            type: GenAiType.ARRAY,
-            items: { type: GenAiType.STRING },
+            type: 'array',
+            items: { type: 'string' },
           },
         },
         required: ['degree', 'institution', 'startDate'],
@@ -247,32 +249,32 @@ const cvParseSchema: GenAiSchema = {
     },
 
     projects: {
-      type: GenAiType.ARRAY,
+      type: 'array',
       items: {
-        type: GenAiType.OBJECT,
+        type: 'object',
         properties: {
-          name: { type: GenAiType.STRING },
-          description: { type: GenAiType.STRING },
+          name: { type: 'string' },
+          description: { type: 'string' },
           tags: {
-            type: GenAiType.ARRAY,
-            items: { type: GenAiType.STRING },
+            type: 'array',
+            items: { type: 'string' },
           },
-          link: { type: GenAiType.STRING },
-          githubLink: { type: GenAiType.STRING },
+          link: { type: 'string' },
+          githubLink: { type: 'string' },
           status: {
-            type: GenAiType.STRING,
+            type: 'string',
             enum: ['Completed', 'In Progress', 'Planned'],
           },
-          startDate: { type: GenAiType.STRING },
-          endDate: { type: GenAiType.STRING },
-          role: { type: GenAiType.STRING },
+          startDate: { type: 'string' },
+          endDate: { type: 'string' },
+          role: { type: 'string' },
           technologies: {
-            type: GenAiType.ARRAY,
-            items: { type: GenAiType.STRING },
+            type: 'array',
+            items: { type: 'string' },
           },
           achievements: {
-            type: GenAiType.ARRAY,
-            items: { type: GenAiType.STRING },
+            type: 'array',
+            items: { type: 'string' },
           },
         },
         required: ['name', 'description', 'status'],
@@ -280,49 +282,49 @@ const cvParseSchema: GenAiSchema = {
     },
 
     certifications: {
-      type: GenAiType.ARRAY,
+      type: 'array',
       items: {
-        type: GenAiType.OBJECT,
+        type: 'object',
         properties: {
-          name: { type: GenAiType.STRING },
-          issuer: { type: GenAiType.STRING },
-          startDate: { type: GenAiType.STRING },
-          endDate: { type: GenAiType.STRING },
-          isPresent: { type: GenAiType.BOOLEAN },
-          credentialId: { type: GenAiType.STRING },
-          link: { type: GenAiType.STRING },
-          expiryDate: { type: GenAiType.STRING },
+          name: { type: 'string' },
+          issuer: { type: 'string' },
+          startDate: { type: 'string' },
+          endDate: { type: 'string' },
+          isPresent: { type: 'boolean' },
+          credentialId: { type: 'string' },
+          link: { type: 'string' },
+          expiryDate: { type: 'string' },
         },
         required: ['name', 'issuer', 'startDate'],
       },
     },
 
     achievements: {
-      type: GenAiType.ARRAY,
+      type: 'array',
       items: {
-        type: GenAiType.OBJECT,
+        type: 'object',
         properties: {
-          title: { type: GenAiType.STRING },
-          description: { type: GenAiType.STRING },
-          startDate: { type: GenAiType.STRING },
-          organization: { type: GenAiType.STRING },
-          link: { type: GenAiType.STRING },
+          title: { type: 'string' },
+          description: { type: 'string' },
+          startDate: { type: 'string' },
+          organization: { type: 'string' },
+          link: { type: 'string' },
         },
         required: ['title', 'startDate'],
       },
     },
 
     languages: {
-      type: GenAiType.ARRAY,
+      type: 'array',
       items: {
-        type: GenAiType.OBJECT,
+        type: 'object',
         properties: {
-          name: { type: GenAiType.STRING },
+          name: { type: 'string' },
           level: {
-            type: GenAiType.STRING,
+            type: 'string',
             enum: ['Beginner', 'Intermediate', 'Advanced', 'Fluent', 'Native', 'Expert'],
           },
-          certification: { type: GenAiType.STRING },
+          certification: { type: 'string' },
         },
         required: ['name', 'level'],
       },
@@ -408,6 +410,7 @@ export class CvParseError extends Error {
     | 'llm-policy'
     | 'llm-invalid'
     | 'llm-transient'
+    | 'llm-not-configured'
     | 'llm-unknown';
   cause?: unknown;
 
@@ -489,6 +492,8 @@ export async function parseCv(args: ParseCvArgs): Promise<CvParseEnvelope> {
           throw new CvParseError('llm-invalid', err.message, err);
         case 'transient':
           throw new CvParseError('llm-transient', err.message, err);
+        case 'not-configured':
+          throw new CvParseError('llm-not-configured', err.message, err);
         case 'unknown':
           throw new CvParseError('llm-unknown', err.message, err);
       }
@@ -500,6 +505,7 @@ export async function parseCv(args: ParseCvArgs): Promise<CvParseEnvelope> {
     data: llmResult.data,
     usage: llmResult.usage,
     modelUsed: llmResult.modelUsed,
+    provider: llmResult.provider,
     inputTruncated: extracted.truncated,
     inputBytes: extracted.bytes,
   };
