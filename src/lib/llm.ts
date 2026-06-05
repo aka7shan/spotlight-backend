@@ -305,17 +305,29 @@ async function runGroq<T>(
   const modelUsed = args.model ?? defaultModel;
   const client = getGroqClient();
 
-  let completion: Awaited<ReturnType<typeof client.chat.completions.create>>;
-  try {
-    completion = (await client.chat.completions.create({
+  type ChatMessage = {
+    role: 'system' | 'user' | 'assistant';
+    content: string;
+  };
+
+  // The messages we'll send. If the first attempt fails with
+  // `tool_use_failed` (a structured-output schema violation), we
+  // append a corrective system message and retry ONCE. Real-world
+  // observation: Llama-class models frequently invent enum values
+  // ("Live" for a project status, etc.) on the first pass and
+  // self-correct reliably when fed the precise error.
+  const baseMessages: ChatMessage[] = [
+    ...(args.systemInstruction
+      ? [{ role: 'system' as const, content: args.systemInstruction }]
+      : []),
+    { role: 'user' as const, content: args.userPrompt },
+  ];
+
+  const callGroq = (messages: ChatMessage[]) =>
+    client.chat.completions.create({
       model: modelUsed,
       temperature: args.temperature ?? 0.1,
-      messages: [
-        ...(args.systemInstruction
-          ? [{ role: 'system' as const, content: args.systemInstruction }]
-          : []),
-        { role: 'user' as const, content: args.userPrompt },
-      ],
+      messages,
       tools: [
         {
           type: 'function',
@@ -335,9 +347,44 @@ async function runGroq<T>(
         type: 'function',
         function: { name: GROQ_TOOL_NAME },
       },
-    })) as Awaited<ReturnType<typeof client.chat.completions.create>>;
+    }) as Promise<Awaited<ReturnType<typeof client.chat.completions.create>>>;
+
+  let completion: Awaited<ReturnType<typeof client.chat.completions.create>>;
+  try {
+    completion = await callGroq(baseMessages);
   } catch (err) {
-    throw mapGroqError(err);
+    // Special-case tool_use_failed: the model produced output that
+    // violated our schema (typically a bad enum value). Retry ONCE
+    // with the validator's complaint appended as a system message —
+    // models reliably self-correct given the precise error.
+    const info = parseGroqApiError(err);
+    if (info?.code === 'tool_use_failed' && info.detail) {
+      console.warn(
+        `[llm.groq] tool_use_failed on first attempt; retrying with corrective hint. detail=${info.detail.slice(0, 200)}`,
+      );
+      try {
+        completion = await callGroq([
+          ...baseMessages,
+          {
+            role: 'system',
+            content: [
+              'Your previous response failed schema validation. Re-emit the structured output, this time obeying the schema exactly.',
+              '',
+              'Validator complaint:',
+              info.detail,
+              '',
+              'Re-emit the JSON now. Use ONLY the enum values listed in the schema. Do NOT invent new values.',
+            ].join('\n'),
+          },
+        ]);
+      } catch (retryErr) {
+        // Retry also failed — surface the retry error so the caller
+        // sees the freshest diagnostic, not the stale first one.
+        throw mapGroqError(retryErr);
+      }
+    } else {
+      throw mapGroqError(err);
+    }
   }
 
   // Narrow off the streaming-completion union — we never request a stream.
@@ -419,40 +466,111 @@ async function runGroq<T>(
   };
 }
 
+/**
+ * Structured view of the error body Groq returns. Their SDK wraps
+ * everything as a single string on `message` (with the JSON body
+ * inlined), so we parse it back out here.
+ *
+ * Why parse it
+ * ------------
+ * The error body's nested `code` / `type` are the ONLY reliable
+ * categorization signal. Trying to substring-match on the message
+ * field is dangerous because the message often contains the
+ * user-provided prompt or the model's free-form text — and that
+ * text can legitimately contain words like "rate limit" (e.g. a
+ * user with a rate-limiter project on their CV) which would
+ * mis-categorize their schema-validation error as a quota error.
+ *
+ * Real example that bit us: a user's CV had "API Rate Limiter" in a
+ * project name; the validator-rejection 400 got mis-mapped to quota,
+ * the dispatcher fell back to Gemini, Gemini was unconfigured, and
+ * the user saw 429 for what was actually a model schema-violation.
+ */
+function parseGroqApiError(err: unknown): {
+  status?: number;
+  /** The HTTP/SDK-level error code if one exists. */
+  topCode?: string;
+  /** The provider's structured error code from the JSON body. */
+  code?: string;
+  /** The provider's `type` from the JSON body. */
+  type?: string;
+  /**
+   * A short human-readable detail extracted from the structured
+   * body. For `tool_use_failed`, this is the validator's complaint.
+   */
+  detail?: string;
+} | null {
+  if (!err || typeof err !== 'object') return null;
+  const e = err as {
+    status?: unknown;
+    code?: unknown;
+    message?: unknown;
+  };
+  const status = typeof e.status === 'number' ? e.status : undefined;
+  const topCode = typeof e.code === 'string' ? e.code : undefined;
+  const message = typeof e.message === 'string' ? e.message : '';
+
+  // Groq's SDK builds `message` as `"<status> <jsonBody>"`. Find the
+  // first '{' and parse from there. If parsing fails we still return
+  // status/topCode so the outer mapper can fall back to those.
+  const braceIdx = message.indexOf('{');
+  if (braceIdx === -1) return { status, topCode };
+
+  let body: unknown;
+  try {
+    body = JSON.parse(message.slice(braceIdx));
+  } catch {
+    return { status, topCode };
+  }
+  if (!body || typeof body !== 'object') return { status, topCode };
+
+  const bodyErr = (body as { error?: unknown }).error;
+  if (!bodyErr || typeof bodyErr !== 'object') return { status, topCode };
+
+  const code =
+    typeof (bodyErr as { code?: unknown }).code === 'string'
+      ? ((bodyErr as { code: string }).code)
+      : undefined;
+  const type =
+    typeof (bodyErr as { type?: unknown }).type === 'string'
+      ? ((bodyErr as { type: string }).type)
+      : undefined;
+  const detail =
+    typeof (bodyErr as { message?: unknown }).message === 'string'
+      ? ((bodyErr as { message: string }).message)
+      : undefined;
+
+  return { status, topCode, code, type, detail };
+}
+
 function mapGroqError(err: unknown): LlmError {
   if (err instanceof LlmError) return err;
   if (err instanceof GroqNotConfiguredError) {
     return new LlmError('not-configured', err.message, 'groq', err);
   }
 
-  // The Groq SDK throws OpenAI-shaped APIError objects with a numeric
-  // `status` and a string `code`. We pattern-match on both.
-  const e = err as {
-    status?: number;
-    code?: string;
-    message?: string;
-  };
-  const status = typeof e?.status === 'number' ? e.status : undefined;
-  const code = typeof e?.code === 'string' ? e.code : undefined;
-  const message = typeof e?.message === 'string' ? e.message : String(err);
-  const lower = (message + ' ' + (code ?? '')).toLowerCase();
+  const info = parseGroqApiError(err);
+  const status = info?.status;
+  const code = info?.code ?? info?.topCode;
+  const type = info?.type;
+  const detail = info?.detail;
 
-  // Log the original error server-side so future diagnostics have a
-  // chance. We don't surface the raw message to the client by default
-  // because it sometimes contains route/internal hints we'd rather not
-  // expose.
+  // Log the structured view server-side so future diagnostics have a
+  // chance even if categorization here ends up wrong.
   console.error('[llm.groq] sdk error', {
     status,
     code,
-    message,
+    type,
+    // Truncate detail because Groq sometimes echoes the entire failed
+    // generation back (multi-KB) and that bloats logs without adding
+    // diagnostic value past the first few hundred chars.
+    detail: detail?.slice(0, 500),
   });
 
-  if (
-    status === 429 ||
-    code === 'rate_limit_exceeded' ||
-    lower.includes('quota') ||
-    lower.includes('rate limit')
-  ) {
+  // 1. Genuine rate limiting. ONLY trust status=429 and explicit code
+  //    fields — never substring-match the message, which often
+  //    contains user/model text.
+  if (status === 429 || code === 'rate_limit_exceeded') {
     return new LlmError(
       'quota',
       'AI provider rate limit reached. Try again shortly.',
@@ -460,10 +578,43 @@ function mapGroqError(err: unknown): LlmError {
       err,
     );
   }
+
+  // 2. Schema-violation / bad request. The tool-call validator's
+  //    `tool_use_failed` is the most common version; the generic
+  //    `invalid_request_error` type covers the rest.
   if (
-    lower.includes('safety') ||
-    lower.includes('content policy') ||
-    lower.includes('content_filter')
+    code === 'tool_use_failed' ||
+    code === 'invalid_request_error' ||
+    type === 'invalid_request_error' ||
+    status === 400
+  ) {
+    return new LlmError(
+      'invalid-response',
+      detail
+        ? `Model output failed schema validation: ${detail.slice(0, 200)}`
+        : 'Model output failed schema validation.',
+      'groq',
+      err,
+    );
+  }
+
+  // 3. Auth/config issues (bad key, etc.). Don't fall back — the user
+  //    needs to fix configuration.
+  if (status === 401 || status === 403 || code === 'invalid_api_key') {
+    return new LlmError(
+      'not-configured',
+      'AI provider rejected our credentials. Check GROQ_API_KEY.',
+      'groq',
+      err,
+    );
+  }
+
+  // 4. Content-policy. Groq surfaces this through dedicated codes,
+  //    not via a substring search.
+  if (
+    code === 'content_filter' ||
+    code === 'safety_violation' ||
+    type === 'content_policy_violation'
   ) {
     return new LlmError(
       'content-policy',
@@ -472,12 +623,27 @@ function mapGroqError(err: unknown): LlmError {
       err,
     );
   }
+
+  // 5. Transient (server / gateway issues).
+  if (status === 502 || status === 503 || status === 504) {
+    return new LlmError(
+      'transient',
+      'AI provider is temporarily unavailable.',
+      'groq',
+      err,
+    );
+  }
+
+  // Network-level errors don't have a status; the SDK wraps them as
+  // `APIConnectionError` etc. Detect the SDK error name as the last
+  // resort signal before giving up.
+  const errName =
+    typeof (err as { name?: unknown })?.name === 'string'
+      ? ((err as { name: string }).name)
+      : undefined;
   if (
-    status === 502 ||
-    status === 503 ||
-    status === 504 ||
-    lower.includes('timeout') ||
-    lower.includes('temporar')
+    errName === 'APIConnectionError' ||
+    errName === 'APIConnectionTimeoutError'
   ) {
     return new LlmError(
       'transient',
@@ -486,9 +652,10 @@ function mapGroqError(err: unknown): LlmError {
       err,
     );
   }
+
   return new LlmError(
     'unknown',
-    message || 'Unknown AI provider error.',
+    detail || (err instanceof Error ? err.message : 'Unknown AI provider error.'),
     'groq',
     err,
   );
@@ -582,7 +749,6 @@ function mapGeminiError(err: unknown): LlmError {
   }
 
   const message = err instanceof Error ? err.message : String(err);
-  const lower = message.toLowerCase();
   const status =
     typeof (err as { status?: unknown })?.status === 'number'
       ? ((err as { status: number }).status as number)
@@ -590,12 +756,34 @@ function mapGeminiError(err: unknown): LlmError {
         ? ((err as { code: number }).code as number)
         : undefined;
 
+  // Try to extract Google's structured `status` field
+  // (RESOURCE_EXHAUSTED, INVALID_ARGUMENT, etc.) from the body. Same
+  // rationale as the Groq parser: substring-matching the message is
+  // dangerous because it often contains the model's free-form text
+  // or the user's prompt.
+  let googleStatus: string | undefined;
+  const braceIdx = message.indexOf('{');
+  if (braceIdx !== -1) {
+    try {
+      const body = JSON.parse(message.slice(braceIdx)) as {
+        error?: { status?: unknown };
+      };
+      if (typeof body?.error?.status === 'string') {
+        googleStatus = body.error.status;
+      }
+    } catch {
+      // Body wasn't JSON. We'll fall through and use status alone.
+    }
+  }
+
   console.error('[llm.gemini] sdk error', {
     status,
-    message,
+    googleStatus,
+    // Truncate to keep logs tidy.
+    message: message.slice(0, 500),
   });
 
-  if (status === 429 || lower.includes('quota') || lower.includes('rate limit')) {
+  if (status === 429 || googleStatus === 'RESOURCE_EXHAUSTED') {
     return new LlmError(
       'quota',
       'AI provider rate limit reached. Try again shortly.',
@@ -604,23 +792,35 @@ function mapGeminiError(err: unknown): LlmError {
     );
   }
   if (
-    lower.includes('safety') ||
-    lower.includes('blocked') ||
-    lower.includes('harm')
+    googleStatus === 'PERMISSION_DENIED' ||
+    googleStatus === 'UNAUTHENTICATED' ||
+    status === 401 ||
+    status === 403
   ) {
     return new LlmError(
-      'content-policy',
-      'Provider refused the request on safety grounds.',
+      'not-configured',
+      'AI provider rejected our credentials. Check GEMINI_API_KEY and project quota.',
       'gemini',
       err,
     );
   }
   if (
+    googleStatus === 'INVALID_ARGUMENT' ||
+    status === 400
+  ) {
+    return new LlmError(
+      'invalid-response',
+      'Provider rejected the request as invalid.',
+      'gemini',
+      err,
+    );
+  }
+  if (
+    googleStatus === 'UNAVAILABLE' ||
+    googleStatus === 'DEADLINE_EXCEEDED' ||
     status === 502 ||
     status === 503 ||
-    status === 504 ||
-    lower.includes('timeout') ||
-    lower.includes('temporar')
+    status === 504
   ) {
     return new LlmError(
       'transient',
